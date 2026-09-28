@@ -10,6 +10,9 @@ These alias the internal gate outcomes; they do not grant mutate rights.
 AI-primer / review-before-deploy guards (WIL-914): malformed or non-finite
 inputs never authorize; Noul never supplies authority; preference fit is
 scored apart from grounding and task success.
+
+RO harden (WIL-914 side branch): unknown types fail-closed; choice/score
+require full shape before act; missing required miss-labels ≠ clean pass.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 STAKES = ("harmless", "ordinary", "draft", "effect")
 MODES = ("legal", "creative")
 BACKEND_VERBS = ("act", "investigate", "clarify")
+KNOWN_ANSWER_TYPES = ("noul", "choice", "score")
 MISS_LABELS = (
     "too_long",
     "stacked_jargon",
@@ -29,6 +33,8 @@ MISS_LABELS = (
     "unsourced_action",
     "hid_option",
 )
+# Required miss-label set for draft_action: absence ≠ clean pass (RO #3).
+REQUIRED_MISS_LABELS = MISS_LABELS
 
 _BACKEND_MAP = {
     "act": "act",
@@ -74,21 +80,70 @@ def _noul(answer: dict) -> float | None:
     return finite_unit(answer.get("noul", answer.get("yes_probability")))
 
 
+def _fail_closed(stakes: str) -> str:
+    """Unknown / malformed / incomplete → never act."""
+    return "stop" if stakes == "effect" else "review"
+
+
+def _options_map(answer: dict) -> dict | None:
+    """Return a well-formed options/criteria/probabilities map, or None."""
+    for key in ("options", "choices", "criteria", "probabilities"):
+        value = answer.get(key)
+        if isinstance(value, dict) and len(value) >= 1:
+            # reject empty-string keys / non-sensible maps
+            if any(not isinstance(k, str) or not k.strip() for k in value.keys()):
+                return None
+            return value
+    return None
+
+
+def choice_well_formed(answer: dict) -> bool:
+    """Choice requires selected choice + well-formed options/choices map (RO #2)."""
+    if not isinstance(answer, dict) or answer.get("type") != "choice":
+        return False
+    choice = answer.get("choice")
+    if choice is None:
+        return False
+    if isinstance(choice, str) and not choice.strip():
+        return False
+    options = _options_map(answer)
+    if options is None:
+        return False
+    # selected choice should be one of the option keys when keys are strings
+    if choice not in options:
+        return False
+    return True
+
+
+def score_well_formed(answer: dict) -> bool:
+    """Score requires a finite numeric score (and optional criteria list)."""
+    if not isinstance(answer, dict) or answer.get("type") != "score":
+        return False
+    score = answer.get("score")
+    if isinstance(score, bool) or score is None:
+        return False
+    if isinstance(score, (int, float)) and math.isfinite(float(score)):
+        return True
+    return False
+
+
 def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
     """Return act, review, stop, or approve for one answer.
 
-    Unavailable / malformed answers → review (ordinary) or stop (effect).
-    Never silently authorize.
+    Unavailable / malformed / unknown-type answers → review (ordinary) or
+    stop (effect). Never silently authorize. High confidence on an unknown
+    type is NOT permission to act (RO #1). Choice/score require full shape
+    before confidence can authorize (RO #2).
     """
     if stakes not in STAKES:
         raise ValueError(f"unknown stakes: {stakes}")
     if not isinstance(answer, dict) or not answer:
-        return "stop" if stakes == "effect" else "review"
+        return _fail_closed(stakes)
     kind = answer.get("type")
     if kind == "noul":
         probability = _noul(answer)
         if probability is None:
-            return "stop" if stakes == "effect" else "review"
+            return _fail_closed(stakes)
         if stakes == "effect":
             # A Noul can only flag that approval may be needed — never authorize.
             return "approve"
@@ -97,6 +152,17 @@ def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
         if probability <= 0.3 or probability >= 0.7:
             return "act"
         return "review"
+
+    # RO #1: unknown / missing type → fail-closed (confidence irrelevant)
+    if kind not in ("choice", "score"):
+        return _fail_closed(stakes)
+
+    # RO #2: full type/shape validation before act
+    if kind == "choice" and not choice_well_formed(answer):
+        return _fail_closed(stakes)
+    if kind == "score" and not score_well_formed(answer):
+        return _fail_closed(stakes)
+
     confidence = _confidence(answer)
     if stakes == "harmless":
         return "act" if confidence is not None else "review"
@@ -132,6 +198,9 @@ def draft_action(answers: dict, mode: str = "legal") -> dict[str, Any]:
     mode=creative: stacked_jargon ignored for revise; invented_fact /
     unsourced_action still count.
     Malformed chips are skipped and force investigate (not act).
+
+    RO #3: REQUIRED_MISS_LABELS must all be present and well-formed for a
+    clean pass. Missing labels ≠ clean pass — fail-closed to review/investigate.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode}")
@@ -144,18 +213,35 @@ def draft_action(answers: dict, mode: str = "legal") -> dict[str, Any]:
             "review": ["malformed_answers"],
             "chips": [],
             "malformed": True,
+            "missing_required": list(REQUIRED_MISS_LABELS),
         }
     reasons: list[str] = []
     uncertain: list[str] = []
     chips: list[dict[str, Any]] = []
     malformed = False
+    missing_required: list[str] = []
     skip_revise = {"stacked_jargon"} if mode == "creative" else set()
     for name in MISS_LABELS:
         answer = answers.get(name)
         if answer is None:
+            missing_required.append(name)
             continue
         if not isinstance(answer, dict):
             malformed = True
+            missing_required.append(name)  # present but unusable counts against completeness
+            continue
+        # Explicit unavailable marker (primer #9 / invented_fact) — not a clear pass
+        if answer.get("unavailable") is True:
+            malformed = True
+            chips.append(
+                {
+                    "id": name,
+                    "noul": None,
+                    "gate": "review",
+                    "backend": "investigate",
+                    "unavailable": True,
+                }
+            )
             continue
         probability = _noul(answer)
         if probability is None:
@@ -178,22 +264,19 @@ def draft_action(answers: dict, mode: str = "legal") -> dict[str, Any]:
             reasons.append(name)
         elif probability > 0.3:
             uncertain.append(name)
-    if malformed and not chips and not reasons:
-        action = "review"
-    elif not chips and not reasons and not uncertain:
-        action = "review" if malformed else "review"
-        if not malformed and not answers:
-            action = "review"
-        elif not malformed and answers and not any(k in answers for k in MISS_LABELS):
-            # answers present but no miss labels scored — investigate, never act
-            action = "review"
-        else:
-            action = "review"
-    elif reasons:
+
+    review_tags = list(uncertain)
+    if malformed:
+        review_tags.append("malformed_inputs")
+    if missing_required:
+        review_tags.append("missing_required_labels")
+
+    if reasons:
         action = "revise"
-    elif uncertain or malformed:
+    elif uncertain or malformed or missing_required:
+        # RO #3: missing required labels block pass/act
         action = "review"
-    elif chips:
+    elif chips and not missing_required:
         action = "pass"
     else:
         action = "review"
@@ -202,9 +285,10 @@ def draft_action(answers: dict, mode: str = "legal") -> dict[str, Any]:
         "backend": _DRAFT_BACKEND[action],
         "mode": mode,
         "revise": reasons,
-        "review": uncertain + (["malformed_inputs"] if malformed else []),
+        "review": review_tags,
         "chips": chips,
         "malformed": malformed,
+        "missing_required": missing_required,
     }
 
 

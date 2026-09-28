@@ -68,10 +68,15 @@ QUESTIONS: dict[str, dict[str, Any]] = {
     },
     "invented_fact": {
         "type": "noul",
-        "instructions": "Does the draft state a fact that is not in the supplied state?",
+        "instructions": (
+            "Does the draft state a fact that is not supported by the SEPARATE "
+            "evidence channel (state.evidence)? The draft itself is NOT evidence. "
+            "If state.evidence.available is false, answer is unavailable — do not clear."
+        ),
         "criteria": {
-            "true": "A fact appears that the state does not support.",
-            "false": "Every factual claim is in the state, or the draft makes no factual claim.",
+            "true": "A fact appears that separate evidence does not support.",
+            "false": "Every factual claim is in separate evidence, or the draft makes no factual claim.",
+            "unavailable": "No separate evidence channel — do not treat draft-in-state as evidence.",
         },
     },
     "wrong_audience": {
@@ -140,7 +145,104 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def call_jev(state: dict, questions: dict | None = None) -> dict:
+def evidence_channel(evidence: dict | None) -> dict[str, Any]:
+    """Separate evidence for invented_fact (primer #9 / RO #4).
+
+    Draft-in-state is NOT independent evidence. Missing/empty/draft-sourced
+    evidence → unavailable (fail-closed; do not clear invented_fact).
+    """
+    if not evidence or not isinstance(evidence, dict):
+        return {
+            "available": False,
+            "backend": "clarify",
+            "text": None,
+            "sha256": None,
+            "note": "No separate evidence channel — invented_fact unavailable; draft is not evidence.",
+        }
+    if evidence.get("is_draft") or evidence.get("source") == "draft":
+        return {
+            "available": False,
+            "backend": "clarify",
+            "text": None,
+            "sha256": None,
+            "note": "Draft-sourced payload rejected — not independent evidence.",
+        }
+    blob = evidence.get("text") or evidence.get("excerpts")
+    if not isinstance(blob, str) or not blob.strip():
+        return {
+            "available": False,
+            "backend": "clarify",
+            "text": None,
+            "sha256": None,
+            "note": "Evidence empty — invented_fact unavailable.",
+        }
+    return {
+        "available": True,
+        "backend": "act",
+        "text": blob,
+        "sha256": _sha(blob),
+        "note": "Separate evidence channel present.",
+    }
+
+
+def outbound_privacy_approval(
+    draft: str,
+    correction: str,
+    *,
+    allow_outbound: bool = False,
+) -> dict[str, Any]:
+    """Local privacy/model approval. MUST run BEFORE any outbound call (RO #5).
+
+    Post-call private_facts noul still gates raw text storage, but cannot
+    authorize the outbound itself (it arrives too late).
+    """
+    if not allow_outbound:
+        return {
+            "ok": False,
+            "reason": "allow_outbound_required",
+            "backend": "clarify",
+            "flagged_hints": False,
+            "note": "Explicit allow_outbound must precede model call; privacy noul alone is not sufficient and arrives too late.",
+        }
+    blob = f"{draft}\n{correction}".lower()
+    hints = (
+        "ssn",
+        "social security",
+        "date of birth",
+        "medical record",
+        " policy number ",
+    )
+    flagged = any(h in blob for h in hints)
+    return {
+        "ok": True,
+        "reason": "approved",
+        "backend": "act",
+        "flagged_hints": flagged,
+        "note": "Local pre-outbound approval granted; post-call private_facts still gates raw text storage.",
+    }
+
+
+def call_jev(
+    state: dict,
+    questions: dict | None = None,
+    *,
+    allow_outbound: bool = False,
+    privacy_approval: dict | None = None,
+) -> dict:
+    """Call TypeSafe Jev. RO #5: refuse unless privacy/model approval already passed."""
+    approval = privacy_approval
+    if approval is None:
+        # Derive a minimal approval check from explicit flag only.
+        approval = {
+            "ok": bool(allow_outbound),
+            "reason": "allow_outbound_true" if allow_outbound else "allow_outbound_required",
+            "note": "call_jev requires allow_outbound=True (privacy/model approval before outbound).",
+        }
+    if not approval.get("ok"):
+        raise RuntimeError(
+            "call_jev blocked: privacy/model approval must run BEFORE outbound call "
+            f"({approval.get('reason') or 'denied'})"
+        )
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if not key:
         raise RuntimeError("TYPESAFE_API_KEY is not set")
@@ -165,19 +267,62 @@ def _load_standing() -> dict:
     return json.loads(STANDING.read_text())
 
 
-def record(draft: str, correction: str, allow_text: bool = False, mode: str = "legal") -> dict:
-    """Label one correction and append a proposal row. Does not apply a rule."""
+def record(
+    draft: str,
+    correction: str,
+    allow_text: bool = False,
+    mode: str = "legal",
+    evidence: dict | None = None,
+    allow_outbound: bool = False,
+) -> dict:
+    """Label one correction and append a proposal row. Does not apply a rule.
+
+    RO #5: outbound_privacy_approval runs BEFORE call_jev.
+    RO #4: invented_fact uses separate evidence channel (draft is not evidence).
+    """
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode}")
-    response = call_jev(
-        {
-            "draft": draft,
-            "correction": correction,
-            "standing_rules": _load_standing(),
-            "mode": mode,
+    # RO #5 — approval BEFORE outbound (not only before ledger write)
+    approval = outbound_privacy_approval(draft, correction, allow_outbound=allow_outbound)
+    if not approval.get("ok"):
+        return {
+            "ok": False,
+            "blocked": True,
+            "applied": False,
+            "backend": "clarify",
+            "privacy_approval": approval,
+            "draft_sha256": _sha(draft),
+            "correction_sha256": _sha(correction),
+            "note": "Outbound blocked — privacy/model approval must precede API call.",
         }
-    )
-    answers = response.get("answers") or {}
+    ev = evidence_channel(evidence)
+    state = {
+        "draft": draft,
+        "correction": correction,
+        "standing_rules": _load_standing(),
+        "mode": mode,
+        # Separate evidence channel — never imply draft is evidence (RO #4)
+        "evidence": {
+            "available": ev["available"],
+            "text": ev["text"] if ev["available"] else None,
+            "sha256": ev.get("sha256"),
+            "note": ev.get("note"),
+        },
+    }
+    questions = dict(QUESTIONS)
+    # If evidence unavailable, do not ask invented_fact against draft-only state
+    if not ev["available"]:
+        questions.pop("invented_fact", None)
+    response = call_jev(state, questions, allow_outbound=True, privacy_approval=approval)
+    answers = dict(response.get("answers") or {})
+    if not ev["available"]:
+        answers["invented_fact"] = {
+            "type": "noul",
+            "noul": None,
+            "unavailable": True,
+            "backend": "clarify",
+            "note": ev.get("note") or "primer #9 — no independent evidence",
+        }
     private = (answers.get("private_facts") or {}).get("noul")
     # Privacy noul alone must NOT permit raw text storage (primer #7).
     # Require explicit allow_text AND finite private_facts < 0.7.
@@ -203,7 +348,9 @@ def record(draft: str, correction: str, allow_text: bool = False, mode: str = "l
         "applied": False,
         "synthetic": False,
         "prefs_eligible": False,
-        "evidence_sha256": None,
+        "evidence_sha256": ev.get("sha256"),
+        "evidence_available": ev["available"],
+        "privacy_approval": approval,
         "usage": response.get("usage"),
     }
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -212,14 +359,65 @@ def record(draft: str, correction: str, allow_text: bool = False, mode: str = "l
     return row
 
 
-def gate_draft(draft: str) -> dict:
-    """Score a draft against the miss labels. Does not write the ledger."""
-    response = call_jev({"draft": draft, "correction": "", "standing_rules": _load_standing()})
-    answers = response.get("answers") or {}
+def gate_draft(
+    draft: str,
+    evidence: dict | None = None,
+    *,
+    allow_outbound: bool = False,
+) -> dict:
+    """Score a draft against the miss labels. Does not write the ledger.
+
+    RO #5: privacy approval before outbound. RO #4: separate evidence channel.
+    """
+    approval = outbound_privacy_approval(draft, "", allow_outbound=allow_outbound)
+    if not approval.get("ok"):
+        return {
+            "ok": False,
+            "blocked": True,
+            "backend": "clarify",
+            "privacy_approval": approval,
+            "draft_gate": {
+                "action": "review",
+                "backend": "clarify",
+                "revise": [],
+                "review": ["outbound_privacy_blocked"],
+                "chips": [],
+                "malformed": False,
+                "missing_required": [],
+            },
+            "note": "Outbound blocked — privacy/model approval must precede API call.",
+        }
+    ev = evidence_channel(evidence)
+    state = {
+        "draft": draft,
+        "correction": "",
+        "standing_rules": _load_standing(),
+        "evidence": {
+            "available": ev["available"],
+            "text": ev["text"] if ev["available"] else None,
+            "sha256": ev.get("sha256"),
+            "note": ev.get("note"),
+        },
+    }
+    questions = dict(QUESTIONS)
+    if not ev["available"]:
+        questions.pop("invented_fact", None)
+    response = call_jev(state, questions, allow_outbound=True, privacy_approval=approval)
+    answers = dict(response.get("answers") or {})
+    if not ev["available"]:
+        answers["invented_fact"] = {
+            "type": "noul",
+            "noul": None,
+            "unavailable": True,
+            "backend": "clarify",
+            "note": ev.get("note"),
+        }
     return {
         "model": response.get("model"),
         "draft_gate": draft_action(answers),
         "speakable": answers.get("speakable"),
+        "evidence_available": ev["available"],
+        "privacy_approval": approval,
         "usage": response.get("usage"),
     }
 
@@ -461,26 +659,50 @@ def held_out_check(row_id: str | None = None) -> dict:
 
 
 def _offline_checks() -> None:
+    from gate import decide_answer, MISS_LABELS, choice_well_formed
+
+    # High miss → revise even if other labels missing (revise outranks missing)
     assert draft_action({"too_long": {"type": "noul", "noul": 0.91}})["action"] == "revise"
     assert draft_action({"too_long": {"type": "noul", "noul": 0.91}})["backend"] == "clarify"
     assert draft_action({"too_long": {"type": "noul", "noul": 0.5}})["action"] == "review"
     assert draft_action({"too_long": {"type": "noul", "noul": 0.5}})["backend"] == "investigate"
-    assert draft_action({"too_long": {"type": "noul", "noul": 0.1}})["action"] == "pass"
-    assert draft_action({"too_long": {"type": "noul", "noul": 0.1}})["backend"] == "act"
-    # creative mode: stacked_jargon alone does not force revise
-    creative = draft_action({"stacked_jargon": {"type": "noul", "noul": 0.91}}, mode="creative")
+    # RO #3: partial label set with low noul → investigate, NEVER act/pass
+    partial = draft_action({"too_long": {"type": "noul", "noul": 0.01}})
+    assert partial["action"] == "review" and partial["backend"] == "investigate"
+    assert "missing_required_labels" in partial["review"]
+    assert "too_long" not in partial["missing_required"]
+    # Full clean set → pass
+    full_clean = {name: {"type": "noul", "noul": 0.05} for name in MISS_LABELS}
+    assert draft_action(full_clean)["action"] == "pass"
+    assert draft_action(full_clean)["backend"] == "act"
+    # creative mode: stacked_jargon alone does not force revise (full set required for pass)
+    full_creative = {name: {"type": "noul", "noul": 0.05} for name in MISS_LABELS}
+    full_creative["stacked_jargon"] = {"type": "noul", "noul": 0.91}
+    creative = draft_action(full_creative, mode="creative")
     assert creative["action"] == "pass" and creative["backend"] == "act"
     legal = draft_action({"stacked_jargon": {"type": "noul", "noul": 0.91}}, mode="legal")
     assert legal["action"] == "revise" and legal["backend"] == "clarify"
-    from gate import decide_answer
 
     assert decide_answer({"type": "noul", "noul": 0.99}, "effect") == "approve"
     assert backend_verb({"type": "noul", "noul": 0.99}, "effect") == "clarify"
-    assert backend_verb({"type": "choice", "confidence": 0.9}, "ordinary") == "act"
+    # RO #1: unknown type high confidence → investigate (not act)
+    assert backend_verb({"type": "unknown", "confidence": 0.99}, "ordinary") == "investigate"
+    assert decide_answer({"type": "unknown", "confidence": 0.99}, "effect") == "stop"
+    # RO #2: choice without payload → investigate; well-formed choice may act
+    assert backend_verb({"type": "choice", "confidence": 0.99}, "ordinary") == "investigate"
+    well = {
+        "type": "choice",
+        "choice": "drop",
+        "confidence": 0.9,
+        "probabilities": {"drop": 0.9, "keep": 0.1},
+    }
+    assert choice_well_formed(well) is True
+    assert backend_verb(well, "ordinary") == "act"
     assert backend_verb({"type": "choice", "confidence": 0.2}, "ordinary") == "investigate"
     assert decide_answer({"type": "choice", "confidence": 0.2}, "effect") == "stop"
-    assert decide_answer({"type": "choice", "confidence": 0.95}, "effect") == "approve"
-    assert decide_answer({"type": "choice", "confidence": 0.2}, "harmless") == "act"
+    assert decide_answer({"type": "choice", "confidence": 0.95}, "effect") == "stop"  # no payload
+    assert decide_answer({**well, "confidence": 0.95}, "effect") == "approve"
+    assert decide_answer({"type": "choice", "confidence": 0.2}, "harmless") == "review"  # no payload
     assert finite_unit(True) is None
     assert finite_unit(float('nan')) is None
     assert finite_unit(1.5) is None
@@ -494,6 +716,20 @@ def _offline_checks() -> None:
     bad = draft_action({'too_long': {'noul': True}})
     assert bad['backend'] == 'investigate' and bad['malformed'] is True
     assert verify_claims_against_evidence(['x'], None)['ok'] is False
+    # RO #4: evidence_channel rejects draft-as-evidence / missing
+    assert evidence_channel(None)["available"] is False
+    assert evidence_channel({"source": "draft", "text": "x"})["available"] is False
+    assert evidence_channel({"text": "LOR sent 2026-09-01"})["available"] is True
+    # RO #5: outbound blocked without allow_outbound
+    blocked = outbound_privacy_approval("draft", "shorter", allow_outbound=False)
+    assert blocked["ok"] is False and blocked["backend"] == "clarify"
+    ok_out = outbound_privacy_approval("draft", "shorter", allow_outbound=True)
+    assert ok_out["ok"] is True
+    try:
+        call_jev({"draft": "x"}, allow_outbound=False)
+        raise AssertionError("call_jev should block without allow_outbound")
+    except RuntimeError as exc:
+        assert "BEFORE outbound" in str(exc) or "allow_outbound" in str(exc)
 
 
 def main(argv: list[str]) -> int:
@@ -506,7 +742,7 @@ def main(argv: list[str]) -> int:
             "clearly establishes a compelling narrative for immediate escalation."
         )
         correction = "shorter"
-        row = mark_synthetic(record(draft, correction, allow_text=True))
+        row = mark_synthetic(record(draft, correction, allow_text=True, allow_outbound=True))
         # rewrite last ledger line as synthetic-tagged
         rows = _read_ledger()
         if rows:
