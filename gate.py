@@ -58,6 +58,10 @@ def finite_unit(value: Any) -> float | None:
     return None
 
 
+# Bridge gap-close name (WIL-914) — same fail-closed unit interval.
+_finite_unit_interval = finite_unit
+
+
 def _confidence(answer: dict) -> float | None:
     if not isinstance(answer, dict):
         return None
