@@ -659,7 +659,7 @@ def held_out_check(row_id: str | None = None) -> dict:
 
 
 def _offline_checks() -> None:
-    from gate import decide_answer, MISS_LABELS, choice_well_formed
+    from gate import decide_answer, MISS_LABELS, choice_well_formed, score_well_formed
 
     # High miss → revise even if other labels missing (revise outranks missing)
     assert draft_action({"too_long": {"type": "noul", "noul": 0.91}})["action"] == "revise"
@@ -698,6 +698,26 @@ def _offline_checks() -> None:
     }
     assert choice_well_formed(well) is True
     assert backend_verb(well, "ordinary") == "act"
+    # RO dist/EV: negative/unnormalized probs + OOB score must NOT act
+    bad_neg = {"type": "choice", "choice": "x", "probabilities": {"x": -8}, "confidence": 0.99}
+    assert choice_well_formed(bad_neg) is False
+    assert backend_verb(bad_neg, "ordinary") == "investigate"
+    bad_score = {"type": "score", "score": 999, "confidence": 0.99}
+    assert score_well_formed(bad_score) is False
+    assert backend_verb(bad_score, "ordinary") == "investigate"
+    well_score = {
+        "type": "score",
+        "score": 2.0,
+        "confidence": 0.95,
+        "criteria": ["low", "mid", "high"],
+        "probabilities": {"0": 0.0, "1": 0.0, "2": 1.0},
+    }
+    assert score_well_formed(well_score) is True
+    assert backend_verb(well_score, "ordinary") == "act"
+    # selected must be argmax; missing option vs request set fails closed
+    not_argmax = {"type": "choice", "choice": "keep", "confidence": 0.99, "probabilities": {"drop": 0.9, "keep": 0.1}}
+    assert choice_well_formed(not_argmax) is False
+    assert backend_verb(not_argmax, "ordinary") == "investigate"
     assert backend_verb({"type": "choice", "confidence": 0.2}, "ordinary") == "investigate"
     assert decide_answer({"type": "choice", "confidence": 0.2}, "effect") == "stop"
     assert decide_answer({"type": "choice", "confidence": 0.95}, "effect") == "stop"  # no payload
