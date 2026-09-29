@@ -192,6 +192,164 @@ def registered_homes() -> frozenset[str]:
     return frozenset(keys)
 
 
+
+SCOPE_SEP = "::"
+
+
+def scope_key(home: str, mode: str) -> str:
+    """Owned standing key: home × mode (legal/creative coexist under one home)."""
+    return f"{home}{SCOPE_SEP}{mode}"
+
+
+def parse_scope_key(key: str) -> tuple[str | None, str | None]:
+    """Split a scoped key; legacy home-only keys return (home, None)."""
+    if not isinstance(key, str) or not key:
+        return None, None
+    if SCOPE_SEP in key:
+        home, mode = key.split(SCOPE_SEP, 1)
+        return home, mode
+    return key, None
+
+
+def build_scoped_rule(
+    *,
+    home: str,
+    mode: str,
+    draft_sha256: str | None = None,
+    correction_sha256: str | None = None,
+    labels_digest: str | None = None,
+    instruction: str | None = None,
+    correction_text: str | None = None,
+    existing: dict | None = None,
+) -> dict:
+    """Usable scoped proposal content for consumers — not hashes/labels alone.
+
+    Explicit instruction or raw correction text → actionable usable content.
+    When raw correction is absent (privacy / not stored) and no instruction is
+    supplied, content_availability stays unavailable.
+    """
+    base = dict(existing) if isinstance(existing, dict) else {}
+    text = None
+    source = None
+    if isinstance(instruction, str) and instruction.strip():
+        text = instruction.strip()
+        source = "explicit_instruction"
+    elif isinstance(correction_text, str) and correction_text.strip():
+        text = correction_text.strip()
+        source = "explicit_correction"
+    else:
+        prior_instr = base.get("instruction")
+        prior_usable = base.get("usable_content") if isinstance(base.get("usable_content"), dict) else {}
+        prior_text = prior_instr if isinstance(prior_instr, str) else prior_usable.get("text")
+        if isinstance(prior_text, str) and prior_text.strip():
+            text = prior_text.strip()
+            source = prior_usable.get("source") or "existing_scoped_rule"
+
+    rule = {
+        "kind": base.get("kind") or "correction_proposal",
+        "instruction_precedence": "explicit_correction_over_standing",
+        "mode_separation": mode,
+        "scope": scope_key(home, mode),
+        "home": home,
+        "mode": mode,
+        "draft_sha256": draft_sha256 if draft_sha256 is not None else base.get("draft_sha256"),
+        "correction_sha256": correction_sha256 if correction_sha256 is not None else base.get("correction_sha256"),
+        "labels_digest": labels_digest if labels_digest is not None else base.get("labels_digest"),
+    }
+    if text:
+        rule["instruction"] = text
+        rule["usable_content"] = {
+            "kind": "actionable_instruction",
+            "text": text,
+            "source": source,
+        }
+        rule["content_availability"] = "usable"
+    else:
+        rule["instruction"] = None
+        rule["usable_content"] = None
+        rule["content_availability"] = "unavailable"
+        rule["note"] = (
+            "No actionable instruction — raw correction absent; "
+            "scoped_rule remains unavailable for consumer apply."
+        )
+    return rule
+
+
+def resolve_standing_instruction(
+    home: str,
+    mode: str,
+    *,
+    explicit_correction: str | None = None,
+) -> dict:
+    """Actual consumer precedence: explicit correction > standing usable scoped_rule > unavailable.
+
+    Does not mutate standing. Hashes/labels-only standing rules stay unavailable.
+    """
+    scope = scope_key(home, mode)
+    if isinstance(explicit_correction, str) and explicit_correction.strip():
+        return {
+            "availability": "usable",
+            "precedence": "explicit_correction",
+            "instruction": explicit_correction.strip(),
+            "scope": scope,
+            "home": home,
+            "mode": mode,
+            "from_row": None,
+        }
+    standing = _load_standing()
+    labels = standing.get("labels") or {}
+    meta = labels.get(scope)
+    if meta is None:
+        legacy = labels.get(home)
+        if isinstance(legacy, dict) and legacy.get("mode") in (mode, None):
+            # Legacy home-only key: accept when mode matches or mode unset on legacy.
+            if legacy.get("mode") in (mode, None) or legacy.get("mode") == mode:
+                meta = legacy
+        if meta is None and isinstance(legacy, dict) and legacy.get("mode") == mode:
+            meta = legacy
+    if not isinstance(meta, dict):
+        return {
+            "availability": "unavailable",
+            "precedence": None,
+            "instruction": None,
+            "scope": scope,
+            "home": home,
+            "mode": mode,
+            "from_row": None,
+            "note": "No standing scoped rule for this home×mode.",
+        }
+    rule = meta.get("scoped_rule") if isinstance(meta.get("scoped_rule"), dict) else {}
+    instr = rule.get("instruction")
+    usable = rule.get("usable_content") if isinstance(rule.get("usable_content"), dict) else {}
+    if not (isinstance(instr, str) and instr.strip()):
+        instr = usable.get("text") if isinstance(usable.get("text"), str) else None
+    available = rule.get("content_availability") == "usable" or (
+        isinstance(instr, str) and bool(instr.strip())
+    )
+    # Hashes-only (no instruction text) → unavailable even if rule dict exists.
+    if available and isinstance(instr, str) and instr.strip():
+        return {
+            "availability": "usable",
+            "precedence": "standing_scoped_rule",
+            "instruction": instr.strip(),
+            "scope": scope,
+            "home": home,
+            "mode": mode,
+            "from_row": meta.get("from_row"),
+            "instruction_precedence": "explicit_correction_over_standing",
+        }
+    return {
+        "availability": "unavailable",
+        "precedence": None,
+        "instruction": None,
+        "scope": scope,
+        "home": home,
+        "mode": mode,
+        "from_row": meta.get("from_row"),
+        "note": "Standing scoped_rule has no actionable instruction (hashes/labels only).",
+    }
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -473,14 +631,15 @@ def record(
             "version": 1,
             "home": home,
             "mode": mode,
-            "scoped_rule": {
-                "kind": "correction_proposal",
-                "instruction_precedence": "explicit_correction_over_standing",
-                "mode_separation": mode,
-                "draft_sha256": _sha(draft),
-                "correction_sha256": _sha(correction),
-                "labels_digest": _sha(json.dumps(answers, sort_keys=True, default=str)),
-            },
+            "scoped_rule": build_scoped_rule(
+                home=home,
+                mode=mode,
+                draft_sha256=_sha(draft),
+                correction_sha256=_sha(correction),
+                labels_digest=_sha(json.dumps(answers, sort_keys=True, default=str)),
+                # Usable content only when raw correction text is retained (allow_text path).
+                correction_text=correction if store_text else None,
+            ),
             "rollback": {
                 "action": "rollback_proposal",
                 "row_id": row_id,
@@ -711,6 +870,8 @@ def propose_correction_rule(row_id: str) -> dict:
     """Build a usable scoped proposal from a ledger row (no apply).
 
     Preserves explicit instruction precedence and legal/creative mode separation.
+    Scoped key is home × mode so modes coexist. Usable instruction content is
+    required for consumer apply; hashes/labels alone stay unavailable.
     """
     row = load_row(row_id)
     if row is None:
@@ -728,13 +889,20 @@ def propose_correction_rule(row_id: str) -> dict:
     if mode not in MODES:
         return {"ok": False, "reason": "unknown_mode", "mode": mode}
     proposal = row.get("proposal") or {}
-    scoped = proposal.get("scoped_rule") or {
-        "kind": "correction_proposal",
-        "instruction_precedence": "explicit_correction_over_standing",
-        "mode_separation": mode,
-        "draft_sha256": row.get("draft_sha256"),
-        "correction_sha256": row.get("correction_sha256"),
-    }
+    existing = proposal.get("scoped_rule") if isinstance(proposal.get("scoped_rule"), dict) else {}
+    correction_text = row.get("correction") if row.get("text_stored") else None
+    scoped = build_scoped_rule(
+        home=home,
+        mode=mode,
+        draft_sha256=row.get("draft_sha256"),
+        correction_sha256=row.get("correction_sha256"),
+        labels_digest=existing.get("labels_digest") or _sha(
+            json.dumps(row.get("labels") or {}, sort_keys=True, default=str)
+        ),
+        instruction=existing.get("instruction") if isinstance(existing.get("instruction"), str) else None,
+        correction_text=correction_text,
+        existing=existing,
+    )
     version = int(proposal.get("version") or 1)
     return {
         "ok": True,
@@ -742,12 +910,15 @@ def propose_correction_rule(row_id: str) -> dict:
         "version": version,
         "home": home,
         "mode": mode,
+        "scope": scope_key(home, mode),
         "scoped_rule": scoped,
         "instruction_precedence": "explicit_correction_over_standing",
         "rollback": {
             "action": "rollback_proposal",
             "row_id": row["id"],
             "version": version,
+            "scope": scope_key(home, mode),
+            "restores": "owned pre-apply standing snapshot only",
         },
         "applied": False,
         "note": "Proposal only — explicit apply required; rollback available.",
@@ -773,24 +944,79 @@ def replay_proposal(row_id: str) -> dict:
 
 
 def rollback_proposal(row_id: str) -> dict:
-    """Roll back an applied proposal for row_id using the standing snapshot.
+    """Roll back an applied proposal for row_id using the owned standing snapshot.
 
-    If the row was never applied, standing is left unchanged. Always reversible.
+    Restores ONLY the owned home×mode prior state. Later changes on other scopes
+    (or a later owner of the same scope) are not clobbered. Idempotent: a second
+    rollback is a no-op that does not rewrite standing.
     """
+    import copy
+
     row = load_row(row_id)
     if row is None:
         raise KeyError(f"no ledger row: {row_id}")
     standing = _load_standing()
     labels = standing.setdefault("labels", {})
+    snaps = standing.setdefault("apply_snapshots", {})
+    snap = snaps.get(row_id) if isinstance(snaps.get(row_id), dict) else None
+
+    scope = None
+    if snap:
+        scope = snap.get("scope") or (
+            scope_key(snap["home"], snap["mode"])
+            if snap.get("home") and snap.get("mode")
+            else None
+        )
+    if not scope:
+        for key, meta in list(labels.items()):
+            if isinstance(meta, dict) and meta.get("from_row") == row_id:
+                scope = key
+                break
+
+    current = labels.get(scope) if scope else None
+    owns = isinstance(current, dict) and current.get("from_row") == row_id
+    has_snap = snap is not None
+
+    # Fully idle — never applied or already rolled back and snap consumed.
+    if not owns and not has_snap:
+        return {
+            "ok": True,
+            "row_id": row_id,
+            "removed": None,
+            "restored": None,
+            "noop": True,
+            "standing": prefs_snapshot(),
+            "note": "No-op rollback — row not owning a standing scope.",
+        }
+
     removed = None
-    for home, meta in list(labels.items()):
-        if isinstance(meta, dict) and meta.get("from_row") == row_id:
-            removed = {home: labels.pop(home)}
-            break
+    restored = None
+    skipped_later_owner = False
+
+    if owns and scope is not None:
+        removed = {scope: copy.deepcopy(current)}
+        prior = copy.deepcopy(snap.get("prior")) if snap else None
+        if prior is None:
+            labels.pop(scope, None)
+            restored = None
+        else:
+            labels[scope] = prior
+            restored = {scope: prior}
+    elif has_snap and scope is not None:
+        # Snapshot exists but a later owner holds the scope — do not clobber.
+        skipped_later_owner = True
+
+    # Consume snapshot so a repeat rollback is a pure no-op (no history rewrite).
+    if has_snap:
+        snaps.pop(row_id, None)
+
     history = standing.setdefault("rollback_history", [])
     history.append({
         "row_id": row_id,
+        "scope": scope,
         "removed": removed,
+        "restored": restored,
+        "skipped_later_owner": skipped_later_owner,
         "rolled_back_at": _now(),
         "version": (row.get("proposal") or {}).get("version"),
     })
@@ -799,9 +1025,17 @@ def rollback_proposal(row_id: str) -> dict:
     return {
         "ok": True,
         "row_id": row_id,
+        "scope": scope,
         "removed": removed,
+        "restored": restored,
+        "skipped_later_owner": skipped_later_owner,
+        "noop": False,
         "standing": prefs_snapshot(),
-        "note": "Rollback applied; explicit instruction precedence preserved.",
+        "note": (
+            "Rollback skipped restore — later owner holds scope."
+            if skipped_later_owner
+            else "Rollback restored owned prior state only; explicit instruction precedence preserved."
+        ),
     }
 
 
@@ -809,8 +1043,12 @@ def promote_to_standing(row_id: str, apply: bool = False) -> dict:
     """Promote a scoped proposal only with explicit apply. Synthetic rows rejected.
 
     Stores a usable scoped rule + version + rollback handle (not hashes/home alone).
-    Preserves explicit instruction precedence and legal/creative mode separation.
+    Labels are keyed by home × mode so legal/creative coexist. Apply snapshots
+    capture ONLY the owned scope prior; re-apply keeps the original snapshot
+    (idempotent rollback target).
     """
+    import copy
+
     row = load_row(row_id)
     if row is None:
         raise KeyError(f"no ledger row: {row_id}")
@@ -833,25 +1071,31 @@ def promote_to_standing(row_id: str, apply: bool = False) -> dict:
     if not row.get("prefs_eligible"):
         return {"ok": False, "reason": "not_prefs_eligible", "note": "Row not marked prefs_eligible."}
     standing = _load_standing()
-    # snapshot for rollback
-    pre = {
-        "labels": dict(standing.get("labels") or {}),
-        "snapshotted_at": _now(),
-        "for_row": row_id,
-    }
-    snaps = standing.setdefault("apply_snapshots", {})
-    snaps[row_id] = pre
     labels = standing.setdefault("labels", {})
+    snaps = standing.setdefault("apply_snapshots", {})
     home = proposal["home"]
     mode = proposal["mode"]
     version = proposal["version"]
-    labels[home] = {
+    key = scope_key(home, mode)
+    # Idempotent: keep the ORIGINAL pre-apply snapshot for this row.
+    if row_id not in snaps:
+        snaps[row_id] = {
+            "scope": key,
+            "home": home,
+            "mode": mode,
+            "prior": copy.deepcopy(labels.get(key)),
+            "snapshotted_at": _now(),
+            "for_row": row_id,
+        }
+    labels[key] = {
         "from_row": row["id"],
+        "home": home,
+        "mode": mode,
+        "scope": key,
         "correction_sha256": row.get("correction_sha256"),
         "draft_sha256": row.get("draft_sha256"),
         "promoted_at": _now(),
         "version": version,
-        "mode": mode,
         "scoped_rule": proposal["scoped_rule"],
         "instruction_precedence": "explicit_correction_over_standing",
         "rollback": proposal["rollback"],
@@ -865,7 +1109,10 @@ def promote_to_standing(row_id: str, apply: bool = False) -> dict:
         "rollback": proposal["rollback"],
         "version": version,
         "mode": mode,
+        "scope": key,
+        "home": home,
     }
+
 
 def held_out_loaw_calibrate() -> dict:
     """Offline gate-plumbing check on held-out LOAW-shaped fixtures (no LIVE API).
@@ -1125,6 +1372,15 @@ def _offline_checks() -> None:
         "rollback": {"action": "rollback_proposal"},
     }
     assert proposal_shape["scoped_rule"]["instruction_precedence"] == "explicit_correction_over_standing"
+    # Scoped keying + usable content shape (no production write)
+    assert scope_key("writing_skill", "legal") == "writing_skill::legal"
+    usable = build_scoped_rule(
+        home="writing_skill", mode="legal",
+        instruction="Use formal language in legal drafts.",
+    )
+    assert usable["content_availability"] == "usable" and usable["instruction"]
+    absent = build_scoped_rule(home="writing_skill", mode="creative")
+    assert absent["content_availability"] == "unavailable" and absent["usable_content"] is None
 
 def main(argv: list[str]) -> int:
     _offline_checks()
