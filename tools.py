@@ -230,14 +230,33 @@ def standing_instruction(args: dict, ctx=None, **kwargs) -> str:
     explicit = args.get("explicit_correction")
     if explicit is not None and not isinstance(explicit, str):
         return _error("'explicit_correction' must be a string when provided.")
+    import importlib
+    import importlib.util
     import sys
+    from pathlib import Path as _Path
 
-    evolve_mod = sys.modules.get("evolve")
+    evolve_mod = (
+        sys.modules.get("evolve")
+        or sys.modules.get("jev.evolve")
+        or next((m for k, m in sys.modules.items() if k.endswith(".evolve") and hasattr(m, "drafting_standing_context")), None)
+    )
     if evolve_mod is None:
         try:
             from . import evolve as evolve_mod  # type: ignore
         except ImportError:
-            import evolve as evolve_mod  # type: ignore
+            try:
+                evolve_mod = importlib.import_module("evolve")
+            except ImportError:
+                _path = _Path(__file__).resolve().parent / "evolve.py"
+                _spec = importlib.util.spec_from_file_location("jev_evolve_standalone", _path)
+                if _spec is None or _spec.loader is None:
+                    raise
+                evolve_mod = importlib.util.module_from_spec(_spec)
+                # Ensure sibling flat imports (gate) resolve when loaded by file path
+                _plugin_dir = str(_path.parent)
+                if _plugin_dir not in sys.path:
+                    sys.path.insert(0, _plugin_dir)
+                _spec.loader.exec_module(evolve_mod)
     try:
         payload = evolve_mod.drafting_standing_context(
             home.strip(),

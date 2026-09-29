@@ -16,19 +16,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from gate import (
-    draft_action,
-    backend_verb,
-    MODES,
-    finite_unit,
-    authority_from_noul,
-    separate_scores,
-    reject_sycophancy_signal,
-    choice_well_formed,
-    score_well_formed,
-    validate_answers_against_request,
-    request_schema_choice_keys,
-)
+try:
+    from .gate import (
+        draft_action,
+        backend_verb,
+        MODES,
+        finite_unit,
+        authority_from_noul,
+        separate_scores,
+        reject_sycophancy_signal,
+        choice_well_formed,
+        score_well_formed,
+        validate_answers_against_request,
+        request_schema_choice_keys,
+    )
+except ImportError:  # CLI / suite flat load (python evolve.py from plugin dir)
+    from gate import (
+        draft_action,
+        backend_verb,
+        MODES,
+        finite_unit,
+        authority_from_noul,
+        separate_scores,
+        reject_sycophancy_signal,
+        choice_well_formed,
+        score_well_formed,
+        validate_answers_against_request,
+        request_schema_choice_keys,
+    )
 
 DEFAULT_ROOT = Path.home() / ".hermes" / "state" / "jev-evolve"
 ROOT = DEFAULT_ROOT
