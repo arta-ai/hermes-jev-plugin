@@ -301,11 +301,10 @@ def resolve_standing_instruction(
     meta = labels.get(scope)
     if meta is None:
         legacy = labels.get(home)
-        if isinstance(legacy, dict) and legacy.get("mode") in (mode, None):
-            # Legacy home-only key: accept when mode matches or mode unset on legacy.
-            if legacy.get("mode") in (mode, None) or legacy.get("mode") == mode:
-                meta = legacy
-        if meta is None and isinstance(legacy, dict) and legacy.get("mode") == mode:
+        # Unknown scope (home-only key with missing mode) stays unavailable
+        # pending explicit migration to home×mode. Do NOT silently treat
+        # missing mode as legal or creative.
+        if isinstance(legacy, dict) and legacy.get("mode") == mode:
             meta = legacy
     if not isinstance(meta, dict):
         return {
@@ -500,6 +499,49 @@ def call_jev(
     raw["_validation"] = {"ok": True, "failures": {}}
     return raw
 
+
+def _consumer_standing_rules(
+    mode: str,
+    *,
+    home: str | None = None,
+    explicit_correction: str | None = None,
+) -> dict:
+    """Mode-filtered standing payload for authorized consumers (record / gate_draft).
+
+    Replaces sending the entire unfiltered `_load_standing()` map. Legacy
+    home-only keys with missing mode are omitted (unknown scope — pending
+    migration). When `home` is known, includes the call-site result of
+    `resolve_standing_instruction` (mode-filtered resolved instruction).
+    """
+    if mode not in MODES:
+        raise ValueError(f"unknown mode: {mode}")
+    standing = _load_standing()
+    labels = standing.get("labels") or {}
+    filtered: dict[str, Any] = {}
+    for key, meta in labels.items():
+        _h, key_mode = parse_scope_key(key)
+        if key_mode == mode:
+            filtered[key] = meta
+        elif key_mode is None and isinstance(meta, dict) and meta.get("mode") == mode:
+            # Legacy home-only with EXPLICIT mode match — visible under that mode.
+            filtered[key] = meta
+        # missing mode on legacy → omit (unknown scope)
+    out: dict[str, Any] = {
+        "mode": mode,
+        "labels": filtered,
+        "mode_filtered": True,
+        "note": standing.get("note")
+        or "Mode-filtered standing — unknown-scope (missing mode) omitted.",
+    }
+    if isinstance(home, str) and home.strip():
+        out["resolved_instruction"] = resolve_standing_instruction(
+            home.strip(),
+            mode,
+            explicit_correction=explicit_correction,
+        )
+    return out
+
+
 def _load_standing() -> dict:
     if not STANDING.exists():
         return {"labels": {}, "note": "No label is standing until it repeats and apply is explicit."}
@@ -543,7 +585,8 @@ def record(
     state = {
         "draft": draft,
         "correction": correction,
-        "standing_rules": _load_standing(),
+        # Authorized consumer: mode-filtered standing + resolver (not full map).
+        "standing_rules": _consumer_standing_rules(mode),
         "mode": mode,
         "evidence": {
             "available": ev["available"],
@@ -647,6 +690,17 @@ def record(
             },
         },
     }
+    # Call-site: wire mode-filtered resolve_standing_instruction into record consumer.
+    row["resolved_standing_instruction"] = resolve_standing_instruction(
+        home,
+        mode,
+        explicit_correction=correction if store_text else None,
+    )
+    row["standing_rules"] = _consumer_standing_rules(
+        mode,
+        home=home,
+        explicit_correction=correction if store_text else None,
+    )
     if synthetic:
         row = mark_synthetic(row)
         row["proposal"]["rollback"]["row_id"] = row["id"]
@@ -662,11 +716,18 @@ def gate_draft(
     evidence: dict | None = None,
     *,
     allow_outbound: bool = False,
+    mode: str = "legal",
+    home: str | None = None,
+    explicit_correction: str | None = None,
 ) -> dict:
     """Score a draft against the miss labels. Does not write the ledger.
 
     RO #5: privacy approval before outbound. RO #4: separate evidence channel.
+    Authorized consumer: mode-filtered standing via resolve_standing_instruction
+    (not the entire unfiltered `_load_standing()` map).
     """
+    if mode not in MODES:
+        raise ValueError(f"unknown mode: {mode}")
     approval = outbound_privacy_approval(draft, "", allow_outbound=allow_outbound)
     if not approval.get("ok"):
         return {
@@ -686,10 +747,17 @@ def gate_draft(
             "note": "Outbound blocked — privacy/model approval must precede API call.",
         }
     ev = evidence_channel(evidence)
+    standing_rules = _consumer_standing_rules(
+        mode,
+        home=home,
+        explicit_correction=explicit_correction,
+    )
     state = {
         "draft": draft,
         "correction": "",
-        "standing_rules": _load_standing(),
+        # Authorized consumer: mode-filtered standing + optional resolved instruction.
+        "standing_rules": standing_rules,
+        "mode": mode,
         "evidence": {
             "available": ev["available"],
             "text": ev["text"] if ev["available"] else None,
@@ -710,14 +778,20 @@ def gate_draft(
             "backend": "clarify",
             "note": ev.get("note"),
         }
-    return {
+    out = {
         "model": response.get("model"),
-        "draft_gate": draft_action(answers),
+        "draft_gate": draft_action(answers, mode=mode),
         "speakable": answers.get("speakable"),
         "evidence_available": ev["available"],
         "privacy_approval": approval,
         "usage": response.get("usage"),
+        "mode": mode,
+        "standing_rules": standing_rules,
     }
+    if isinstance(home, str) and home.strip():
+        out["resolved_standing_instruction"] = standing_rules.get("resolved_instruction")
+        out["home"] = home.strip()
+    return out
 
 
 def _read_ledger() -> list[dict]:
@@ -1381,6 +1455,60 @@ def _offline_checks() -> None:
     assert usable["content_availability"] == "usable" and usable["instruction"]
     absent = build_scoped_rule(home="writing_skill", mode="creative")
     assert absent["content_availability"] == "unavailable" and absent["usable_content"] is None
+    # Unknown-scope: home-only legacy with missing mode must stay unavailable
+    # (do not silently treat as legal or creative). Isolated temp only.
+    with use_isolated_ledger(reset=True):
+        STANDING.write_text(
+            json.dumps(
+                {
+                    "labels": {
+                        "writing_skill": {
+                            "scoped_rule": {"instruction": "Casual creative prose."}
+                        }
+                    }
+                }
+            )
+            + "\n"
+        )
+        miss_legal = resolve_standing_instruction("writing_skill", "legal")
+        miss_creative = resolve_standing_instruction("writing_skill", "creative")
+        assert miss_legal.get("availability") == "unavailable"
+        assert miss_creative.get("availability") == "unavailable"
+        # Mode-filtered consumer payload omits unknown-scope legacy.
+        filtered = _consumer_standing_rules("legal")
+        assert filtered.get("mode_filtered") is True
+        assert "writing_skill" not in (filtered.get("labels") or {})
+        # Explicit mode on legacy home-only may match; scoped key preferred.
+        STANDING.write_text(
+            json.dumps(
+                {
+                    "labels": {
+                        "writing_skill": {
+                            "mode": "legal",
+                            "scoped_rule": {
+                                "instruction": "Formal legal prose.",
+                                "content_availability": "usable",
+                            },
+                        },
+                        "writing_skill::creative": {
+                            "mode": "creative",
+                            "scoped_rule": {
+                                "instruction": "Casual creative prose.",
+                                "content_availability": "usable",
+                            },
+                        },
+                    }
+                }
+            )
+            + "\n"
+        )
+        legal_ok = resolve_standing_instruction("writing_skill", "legal")
+        assert legal_ok.get("availability") == "usable"
+        assert "Formal" in (legal_ok.get("instruction") or "")
+        creative_only = _consumer_standing_rules("creative", home="writing_skill")
+        assert "writing_skill::creative" in creative_only["labels"]
+        assert "writing_skill" not in creative_only["labels"]  # legal legacy not in creative filter
+        assert creative_only["resolved_instruction"]["availability"] == "usable"
 
 def main(argv: list[str]) -> int:
     _offline_checks()
