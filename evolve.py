@@ -24,15 +24,62 @@ from gate import (
     authority_from_noul,
     separate_scores,
     reject_sycophancy_signal,
+    choice_well_formed,
+    score_well_formed,
+    validate_answers_against_request,
+    request_schema_choice_keys,
 )
 
-ROOT = Path.home() / ".hermes" / "state" / "jev-evolve"
+DEFAULT_ROOT = Path.home() / ".hermes" / "state" / "jev-evolve"
+ROOT = DEFAULT_ROOT
 LEDGER = ROOT / "ledger.jsonl"
 STANDING = ROOT / "standing.json"
 SYNTHETIC_PREFIX = "syn-"
 HELD_OUT_DIR = ROOT / "held-out-loaw"
+PROVE_ISOLATED_DIRNAME = "isolated-prove"
 MODEL = "jev-1.13.0"
 API_URL = "https://api.typesafe.ai/v1/systemone"
+
+
+def _sync_paths(root: Path) -> None:
+    """Rebind module ledger paths to root. Production default stays DEFAULT_ROOT."""
+    global ROOT, LEDGER, STANDING, HELD_OUT_DIR
+    ROOT = Path(root)
+    LEDGER = ROOT / "ledger.jsonl"
+    STANDING = ROOT / "standing.json"
+    HELD_OUT_DIR = ROOT / "held-out-loaw"
+
+
+def isolated_ledger_root(base: Path | None = None, name: str = PROVE_ISOLATED_DIRNAME) -> Path:
+    """Return an isolated prove/held-out ledger root (never the production ledger)."""
+    parent = Path(base) if base is not None else DEFAULT_ROOT
+    return parent / name
+
+
+class use_isolated_ledger:
+    """Context manager: redirect ROOT/LEDGER to an isolated path for prove/held-out.
+
+    Production ~/.hermes/state/jev-evolve/ledger.jsonl is never written while active.
+    """
+
+    def __init__(self, root: Path | None = None, *, reset: bool = False):
+        self.root = Path(root) if root is not None else isolated_ledger_root()
+        self.reset = reset
+        self._prior: Path | None = None
+
+    def __enter__(self):
+        import shutil
+        self._prior = ROOT
+        if self.reset and self.root.exists():
+            shutil.rmtree(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        _sync_paths(self.root)
+        return self.root
+
+    def __exit__(self, *exc):
+        if self._prior is not None:
+            _sync_paths(self._prior)
+        return False
 
 HOMES = {
     "writing_skill": "Voice or structure miss. Propose a writing-skill rule. Do not edit the skill from one row.",
@@ -137,6 +184,14 @@ QUESTIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def registered_homes() -> frozenset[str]:
+    """Trusted home option set from the request schema (HOMES / QUESTIONS['home'])."""
+    keys = request_schema_choice_keys(QUESTIONS.get("home"))
+    if keys is None:
+        keys = list(HOMES.keys())
+    return frozenset(keys)
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -229,10 +284,13 @@ def call_jev(
     allow_outbound: bool = False,
     privacy_approval: dict | None = None,
 ) -> dict:
-    """Call TypeSafe Jev. RO #5: refuse unless privacy/model approval already passed."""
+    """Call TypeSafe Jev. RO #5: refuse unless privacy/model approval already passed.
+
+    HTTP errors never leak provider body. Response answers are validated against
+    the trusted request questions before return; unbound/malformed raises RuntimeError.
+    """
     approval = privacy_approval
     if approval is None:
-        # Derive a minimal approval check from explicit flag only.
         approval = {
             "ok": bool(allow_outbound),
             "reason": "allow_outbound_true" if allow_outbound else "allow_outbound_required",
@@ -246,7 +304,10 @@ def call_jev(
     key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if not key:
         raise RuntimeError("TYPESAFE_API_KEY is not set")
-    payload = {"model": MODEL, "state": state, "questions": questions or QUESTIONS}
+    req_questions = questions or QUESTIONS
+    if not isinstance(req_questions, dict) or not req_questions:
+        raise RuntimeError("call_jev requires a non-empty trusted questions schema")
+    payload = {"model": MODEL, "state": state, "questions": req_questions}
     req = urllib.request.Request(
         API_URL,
         data=json.dumps(payload).encode(),
@@ -255,11 +316,31 @@ def call_jev(
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
+            raw = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()[:300]
-        raise RuntimeError(f"TypeSafe HTTP {exc.code}: {detail}") from exc
-
+        # Sanitize: discard provider body — status only (no leak).
+        try:
+            exc.read()  # drain without exposing
+        except Exception:
+            pass
+        raise RuntimeError(f"TypeSafe HTTP {exc.code}: request failed") from None
+    except urllib.error.URLError:
+        raise RuntimeError("TypeSafe unreachable: request failed") from None
+    if not isinstance(raw, dict):
+        raise RuntimeError("TypeSafe response invalid: not an object")
+    answers = raw.get("answers")
+    bound = validate_answers_against_request(
+        answers if isinstance(answers, dict) else None, req_questions
+    )
+    if not bound["ok"]:
+        raise RuntimeError(
+            "TypeSafe response failed request-bound validation: "
+            + ",".join(f"{k}={v}" for k, v in sorted(bound["failures"].items())[:8])
+        )
+    raw = dict(raw)
+    raw["_request_bound"] = True
+    raw["_validation"] = {"ok": True, "failures": {}}
+    return raw
 
 def _load_standing() -> dict:
     if not STANDING.exists():
@@ -274,21 +355,26 @@ def record(
     mode: str = "legal",
     evidence: dict | None = None,
     allow_outbound: bool = False,
+    *,
+    synthetic: bool = False,
+    append: bool = True,
 ) -> dict:
-    """Label one correction and append a proposal row. Does not apply a rule.
+    """Label one correction and optionally append a proposal row. Does not apply a rule.
 
     RO #5: outbound_privacy_approval runs BEFORE call_jev.
     RO #4: invented_fact uses separate evidence channel (draft is not evidence).
+    Request-bound validation runs BEFORE any ledger append — unknown home,
+    missing answers, or unbound choice/score never write a row.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode}")
-    # RO #5 — approval BEFORE outbound (not only before ledger write)
     approval = outbound_privacy_approval(draft, correction, allow_outbound=allow_outbound)
     if not approval.get("ok"):
         return {
             "ok": False,
             "blocked": True,
             "applied": False,
+            "appended": False,
             "backend": "clarify",
             "privacy_approval": approval,
             "draft_sha256": _sha(draft),
@@ -301,7 +387,6 @@ def record(
         "correction": correction,
         "standing_rules": _load_standing(),
         "mode": mode,
-        # Separate evidence channel — never imply draft is evidence (RO #4)
         "evidence": {
             "available": ev["available"],
             "text": ev["text"] if ev["available"] else None,
@@ -310,7 +395,6 @@ def record(
         },
     }
     questions = dict(QUESTIONS)
-    # If evidence unavailable, do not ask invented_fact against draft-only state
     if not ev["available"]:
         questions.pop("invented_fact", None)
     response = call_jev(state, questions, allow_outbound=True, privacy_approval=approval)
@@ -323,15 +407,46 @@ def record(
             "backend": "clarify",
             "note": ev.get("note") or "primer #9 — no independent evidence",
         }
+    # Validate only request-asked keys. Synthetic invented_fact injection
+    # (primer #9 unavailable marker) is added for draft_action and is not an
+    # "answer" from the provider — exclude it from extras rejection.
+    bound = validate_answers_against_request(
+        {k: answers[k] for k in questions if k in answers},
+        questions,
+    )
+    homes = registered_homes()
+    home_ans = answers.get("home") if isinstance(answers.get("home"), dict) else {}
+    home_choice = home_ans.get("choice")
+    home_ok = (
+        isinstance(home_choice, str)
+        and home_choice in homes
+        and choice_well_formed(home_ans, QUESTIONS.get("home"))
+    )
+    if not bound["ok"] or not home_ok:
+        failures = dict(bound.get("failures") or {})
+        if not home_ok:
+            failures["home"] = "unregistered_or_unbound_home"
+        return {
+            "ok": False,
+            "blocked": True,
+            "applied": False,
+            "appended": False,
+            "backend": "investigate",
+            "proposed_home": None,
+            "validation_failures": failures,
+            "draft_sha256": _sha(draft),
+            "correction_sha256": _sha(correction),
+            "privacy_approval": approval,
+            "note": "Request-bound validation failed — ledger row NOT appended.",
+        }
     private = (answers.get("private_facts") or {}).get("noul")
-    # Privacy noul alone must NOT permit raw text storage (primer #7).
-    # Require explicit allow_text AND finite private_facts < 0.7.
     private_ok = finite_unit(private)
     store_text = bool(allow_text) and private_ok is not None and private_ok < 0.7
-    home = (answers.get("home") or {}).get("choice") or "drop"
+    home = home_choice
     gate = draft_action(answers, mode=mode)
+    row_id = _sha(_now() + _sha(draft) + _sha(correction))[:16]
     row = {
-        "id": _sha(_now() + _sha(draft) + _sha(correction))[:16],
+        "id": row_id,
         "ts": _now(),
         "model": response.get("model"),
         "mode": mode,
@@ -344,20 +459,44 @@ def record(
         "draft_gate": gate,
         "backend": gate.get("backend"),
         "proposed_home": home,
-        "home_confidence": (answers.get("home") or {}).get("confidence"),
+        "home_confidence": home_ans.get("confidence"),
         "applied": False,
-        "synthetic": False,
+        "synthetic": bool(synthetic),
         "prefs_eligible": False,
         "evidence_sha256": ev.get("sha256"),
         "evidence_available": ev["available"],
         "privacy_approval": approval,
         "usage": response.get("usage"),
+        "ok": True,
+        "appended": False,
+        "proposal": {
+            "version": 1,
+            "home": home,
+            "mode": mode,
+            "scoped_rule": {
+                "kind": "correction_proposal",
+                "instruction_precedence": "explicit_correction_over_standing",
+                "mode_separation": mode,
+                "draft_sha256": _sha(draft),
+                "correction_sha256": _sha(correction),
+                "labels_digest": _sha(json.dumps(answers, sort_keys=True, default=str)),
+            },
+            "rollback": {
+                "action": "rollback_proposal",
+                "row_id": row_id,
+                "restores": "pre-apply standing snapshot",
+            },
+        },
     }
-    ROOT.mkdir(parents=True, exist_ok=True)
-    with LEDGER.open("a") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if synthetic:
+        row = mark_synthetic(row)
+        row["proposal"]["rollback"]["row_id"] = row["id"]
+    if append:
+        ROOT.mkdir(parents=True, exist_ok=True)
+        with LEDGER.open("a") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        row["appended"] = True
     return row
-
 
 def gate_draft(
     draft: str,
@@ -503,12 +642,20 @@ def mark_synthetic(row: dict) -> dict:
 
 
 def verify_claims_against_evidence(claims: list[str], evidence: dict | None) -> dict:
-    """Factual claims require separately supplied evidence (primer #9)."""
+    """Lexical occurrence check only — NOT factual/semantic verification.
+
+    Substring presence proves occurrence-only. Semantic support is unavailable
+    unless a separate assessment is supplied. Negating text that contains the
+    claim words must NOT authorize (e.g. "...claim is false" still matches
+    lexically but semantic_support=unavailable).
+    """
     if not evidence or not isinstance(evidence, dict):
         return {
             "ok": False,
             "backend": "clarify",
             "unsupported": list(claims),
+            "occurrence_only": [],
+            "semantic_support": "unavailable",
             "note": "No separate evidence supplied — do not authorize.",
         }
     blob = evidence.get("text") or evidence.get("excerpts") or ""
@@ -517,19 +664,54 @@ def verify_claims_against_evidence(claims: list[str], evidence: dict | None) -> 
             "ok": False,
             "backend": "clarify",
             "unsupported": list(claims),
+            "occurrence_only": [],
+            "semantic_support": "unavailable",
             "note": "Evidence empty — do not authorize.",
         }
-    unsupported = [c for c in claims if c and c.lower() not in blob.lower()]
+    blob_l = blob.lower()
+    occurrence_only = []
+    unsupported = []
+    for claim in claims:
+        if not claim or not isinstance(claim, str):
+            unsupported.append(claim)
+            continue
+        if claim.lower() in blob_l:
+            occurrence_only.append(claim)
+        else:
+            unsupported.append(claim)
+    # Lexical hits are NEVER sufficient for ok/act authorization.
+    semantic = evidence.get("semantic_support")
+    if semantic in (True, "supported", "yes"):
+        # Only an explicit separate semantic assessment may authorize.
+        ok = len(unsupported) == 0
+        return {
+            "ok": ok,
+            "backend": "act" if ok else "investigate",
+            "unsupported": unsupported,
+            "occurrence_only": occurrence_only,
+            "semantic_support": "supported",
+            "evidence_sha256": _sha(blob),
+            "note": "Separate semantic_support provided on evidence channel.",
+        }
     return {
-        "ok": len(unsupported) == 0,
-        "backend": "act" if not unsupported else "investigate",
+        "ok": False,
+        "backend": "investigate",
         "unsupported": unsupported,
+        "occurrence_only": occurrence_only,
+        "semantic_support": "unavailable",
         "evidence_sha256": _sha(blob),
+        "note": "Lexical occurrence only — substring presence is not factual verification.",
     }
 
+def _standing_snapshot() -> dict:
+    return dict(_load_standing())
 
-def promote_to_standing(row_id: str, apply: bool = False) -> dict:
-    """Promote a label only with explicit apply. Synthetic rows rejected."""
+
+def propose_correction_rule(row_id: str) -> dict:
+    """Build a usable scoped proposal from a ledger row (no apply).
+
+    Preserves explicit instruction precedence and legal/creative mode separation.
+    """
     row = load_row(row_id)
     if row is None:
         raise KeyError(f"no ledger row: {row_id}")
@@ -539,29 +721,159 @@ def promote_to_standing(row_id: str, apply: bool = False) -> dict:
             "reason": "synthetic_excluded",
             "note": "Synthetic proof rows stay out of preference learning.",
         }
+    home = row.get("proposed_home") or "drop"
+    if home not in registered_homes() or home == "drop":
+        return {"ok": False, "reason": "home_not_promotable", "home": home}
+    mode = row.get("mode") or "legal"
+    if mode not in MODES:
+        return {"ok": False, "reason": "unknown_mode", "mode": mode}
+    proposal = row.get("proposal") or {}
+    scoped = proposal.get("scoped_rule") or {
+        "kind": "correction_proposal",
+        "instruction_precedence": "explicit_correction_over_standing",
+        "mode_separation": mode,
+        "draft_sha256": row.get("draft_sha256"),
+        "correction_sha256": row.get("correction_sha256"),
+    }
+    version = int(proposal.get("version") or 1)
+    return {
+        "ok": True,
+        "row_id": row["id"],
+        "version": version,
+        "home": home,
+        "mode": mode,
+        "scoped_rule": scoped,
+        "instruction_precedence": "explicit_correction_over_standing",
+        "rollback": {
+            "action": "rollback_proposal",
+            "row_id": row["id"],
+            "version": version,
+        },
+        "applied": False,
+        "note": "Proposal only — explicit apply required; rollback available.",
+    }
+
+
+def replay_proposal(row_id: str) -> dict:
+    """Replay a stored proposal without mutating standing or skills."""
+    proposal = propose_correction_rule(row_id)
+    if not proposal.get("ok"):
+        return proposal
+    again = replay_row(row_id)
+    return {
+        "ok": True,
+        "row_id": row_id,
+        "proposal": proposal,
+        "replay": again,
+        "mutated": False,
+        "standing_unchanged": True,
+        "instruction_precedence": "explicit_correction_over_standing",
+        "mode_separation": proposal.get("mode"),
+    }
+
+
+def rollback_proposal(row_id: str) -> dict:
+    """Roll back an applied proposal for row_id using the standing snapshot.
+
+    If the row was never applied, standing is left unchanged. Always reversible.
+    """
+    row = load_row(row_id)
+    if row is None:
+        raise KeyError(f"no ledger row: {row_id}")
+    standing = _load_standing()
+    labels = standing.setdefault("labels", {})
+    removed = None
+    for home, meta in list(labels.items()):
+        if isinstance(meta, dict) and meta.get("from_row") == row_id:
+            removed = {home: labels.pop(home)}
+            break
+    history = standing.setdefault("rollback_history", [])
+    history.append({
+        "row_id": row_id,
+        "removed": removed,
+        "rolled_back_at": _now(),
+        "version": (row.get("proposal") or {}).get("version"),
+    })
+    ROOT.mkdir(parents=True, exist_ok=True)
+    STANDING.write_text(json.dumps(standing, indent=2) + "\n")
+    return {
+        "ok": True,
+        "row_id": row_id,
+        "removed": removed,
+        "standing": prefs_snapshot(),
+        "note": "Rollback applied; explicit instruction precedence preserved.",
+    }
+
+
+def promote_to_standing(row_id: str, apply: bool = False) -> dict:
+    """Promote a scoped proposal only with explicit apply. Synthetic rows rejected.
+
+    Stores a usable scoped rule + version + rollback handle (not hashes/home alone).
+    Preserves explicit instruction precedence and legal/creative mode separation.
+    """
+    row = load_row(row_id)
+    if row is None:
+        raise KeyError(f"no ledger row: {row_id}")
+    if row.get("synthetic") or str(row.get("id", "")).startswith(SYNTHETIC_PREFIX):
+        return {
+            "ok": False,
+            "reason": "synthetic_excluded",
+            "note": "Synthetic proof rows stay out of preference learning.",
+        }
+    proposal = propose_correction_rule(row_id)
+    if not proposal.get("ok"):
+        return proposal
     if not apply:
-        return {"ok": False, "reason": "apply_false", "note": "Explicit apply required."}
+        return {
+            "ok": False,
+            "reason": "apply_false",
+            "proposal": proposal,
+            "note": "Explicit apply required. Proposal/replay/rollback available without apply.",
+        }
     if not row.get("prefs_eligible"):
         return {"ok": False, "reason": "not_prefs_eligible", "note": "Row not marked prefs_eligible."}
     standing = _load_standing()
+    # snapshot for rollback
+    pre = {
+        "labels": dict(standing.get("labels") or {}),
+        "snapshotted_at": _now(),
+        "for_row": row_id,
+    }
+    snaps = standing.setdefault("apply_snapshots", {})
+    snaps[row_id] = pre
     labels = standing.setdefault("labels", {})
-    home = row.get("proposed_home") or "drop"
-    if home == "drop":
-        return {"ok": False, "reason": "home_drop"}
+    home = proposal["home"]
+    mode = proposal["mode"]
+    version = proposal["version"]
     labels[home] = {
         "from_row": row["id"],
         "correction_sha256": row.get("correction_sha256"),
+        "draft_sha256": row.get("draft_sha256"),
         "promoted_at": _now(),
+        "version": version,
+        "mode": mode,
+        "scoped_rule": proposal["scoped_rule"],
+        "instruction_precedence": "explicit_correction_over_standing",
+        "rollback": proposal["rollback"],
     }
     ROOT.mkdir(parents=True, exist_ok=True)
     STANDING.write_text(json.dumps(standing, indent=2) + "\n")
-    return {"ok": True, "standing": prefs_snapshot()}
-
+    return {
+        "ok": True,
+        "standing": prefs_snapshot(),
+        "proposal": proposal,
+        "rollback": proposal["rollback"],
+        "version": version,
+        "mode": mode,
+    }
 
 def held_out_loaw_calibrate() -> dict:
-    """Calibrate gates on held-out LOAW-shaped tasks (no LIVE API; offline labels).
+    """Offline gate-plumbing check on held-out LOAW-shaped fixtures (no LIVE API).
 
-    Preference / grounding / success scored separately. Synthetic rows tagged.
+    Feeds prewritten model labels through draft_action / separate_scores /
+    authority guards. This proves GATE PLUMBING only — it is NOT held-out model
+    calibration and must not be reported as model calibration.
+    Preference / grounding / success scored separately. Synthetic; not prefs learning.
     """
     tasks = [
         {
@@ -618,10 +930,13 @@ def held_out_loaw_calibrate() -> dict:
         and results[-1]["scores"]["usable"] is False
         and all(r["sycophancy"]["reward_allowed"] is False for r in results)
         and evidence["ok"] is False
+        and evidence.get("semantic_support") == "unavailable"
         and auth_check_ok(results),
+        "kind": "gate_plumbing_offline",
+        "model_calibration": False,
         "tasks": results,
         "evidence_sample": evidence,
-        "note": "Held-out LOAW calibrate offline; synthetic; not prefs learning.",
+        "note": "Gate plumbing only (prewritten labels) — NOT held-out model calibration. Synthetic; not prefs learning.",
     }
 
 
@@ -688,54 +1003,80 @@ def _offline_checks() -> None:
     # RO #1: unknown type high confidence → investigate (not act)
     assert backend_verb({"type": "unknown", "confidence": 0.99}, "ordinary") == "investigate"
     assert decide_answer({"type": "unknown", "confidence": 0.99}, "effect") == "stop"
-    # RO #2: choice without payload → investigate; well-formed choice may act
+    # RO #2: choice without payload / without trusted request → investigate
     assert backend_verb({"type": "choice", "confidence": 0.99}, "ordinary") == "investigate"
+    choice_req = {"type": "choice", "criteria": {"drop": "d", "keep": "k"}}
     well = {
         "type": "choice",
         "choice": "drop",
         "confidence": 0.9,
         "probabilities": {"drop": 0.9, "keep": 0.1},
     }
-    assert choice_well_formed(well) is True
-    assert backend_verb(well, "ordinary") == "act"
+    # Without trusted request schema → fail-closed (never trust answer keys)
+    assert choice_well_formed(well) is False
+    assert backend_verb(well, "ordinary") == "investigate"
+    assert choice_well_formed(well, choice_req) is True
+    assert backend_verb(well, "ordinary", choice_req) == "act"
+    # Adversary answer self-supplying request_options / option keys → rejected
+    evil = {
+        "type": "choice",
+        "choice": "attacker",
+        "confidence": 0.99,
+        "probabilities": {"attacker": 1.0},
+        "request_options": ["attacker"],
+        "expected_options": ["attacker"],
+    }
+    assert choice_well_formed(evil) is False
+    assert choice_well_formed(evil, choice_req) is False
+    assert backend_verb(evil, "ordinary", choice_req) == "investigate"
     # RO dist/EV: negative/unnormalized probs + OOB score must NOT act
     bad_neg = {"type": "choice", "choice": "x", "probabilities": {"x": -8}, "confidence": 0.99}
-    assert choice_well_formed(bad_neg) is False
-    assert backend_verb(bad_neg, "ordinary") == "investigate"
+    assert choice_well_formed(bad_neg, {"type": "choice", "criteria": {"x": "x"}}) is False
+    assert backend_verb(bad_neg, "ordinary", {"type": "choice", "criteria": {"x": "x"}}) == "investigate"
     bad_score = {"type": "score", "score": 999, "confidence": 0.99}
+    score_req = {"type": "score", "criteria": ["low", "mid", "high"]}
     assert score_well_formed(bad_score) is False
-    assert backend_verb(bad_score, "ordinary") == "investigate"
+    assert score_well_formed(bad_score, score_req) is False
+    assert backend_verb(bad_score, "ordinary", score_req) == "investigate"
     well_score = {
         "type": "score",
         "score": 2.0,
         "confidence": 0.95,
-        "criteria": ["low", "mid", "high"],
         "probabilities": {"0": 0.0, "1": 0.0, "2": 1.0},
     }
-    assert score_well_formed(well_score) is True
-    assert backend_verb(well_score, "ordinary") == "act"
+    # Answer-embedded criteria alone is NOT trusted
+    assert score_well_formed({**well_score, "criteria": ["low", "mid", "high"]}) is False
+    assert score_well_formed(well_score, score_req) is True
+    assert backend_verb(well_score, "ordinary", score_req) == "act"
     # selected must be argmax; missing option vs request set fails closed
     not_argmax = {"type": "choice", "choice": "keep", "confidence": 0.99, "probabilities": {"drop": 0.9, "keep": 0.1}}
-    assert choice_well_formed(not_argmax) is False
-    assert backend_verb(not_argmax, "ordinary") == "investigate"
+    assert choice_well_formed(not_argmax, choice_req) is False
+    assert backend_verb(not_argmax, "ordinary", choice_req) == "investigate"
     assert backend_verb({"type": "choice", "confidence": 0.2}, "ordinary") == "investigate"
     assert decide_answer({"type": "choice", "confidence": 0.2}, "effect") == "stop"
     assert decide_answer({"type": "choice", "confidence": 0.95}, "effect") == "stop"  # no payload
-    assert decide_answer({**well, "confidence": 0.95}, "effect") == "approve"
+    assert decide_answer({**well, "confidence": 0.95}, "effect", choice_req) == "approve"
     assert decide_answer({"type": "choice", "confidence": 0.2}, "harmless") == "review"  # no payload
     assert finite_unit(True) is None
-    assert finite_unit(float('nan')) is None
+    assert finite_unit(float("nan")) is None
     assert finite_unit(1.5) is None
     assert finite_unit(0.5) == 0.5
-    assert decide_answer({}, 'effect') == 'stop'
-    assert decide_answer({'type': 'noul', 'noul': True}, 'ordinary') == 'review'
-    assert authority_from_noul({'type': 'noul', 'noul': 0.99})['authority'] is False
+    assert decide_answer({}, "effect") == "stop"
+    assert decide_answer({"type": "noul", "noul": True}, "ordinary") == "review"
+    assert authority_from_noul({"type": "noul", "noul": 0.99})["authority"] is False
     sep = separate_scores(0.9, 0.2, 0.8)
-    assert sep['combined_forbidden'] is True and sep['authorize'] is False
-    assert reject_sycophancy_signal(0.99)['reward_allowed'] is False
-    bad = draft_action({'too_long': {'noul': True}})
-    assert bad['backend'] == 'investigate' and bad['malformed'] is True
-    assert verify_claims_against_evidence(['x'], None)['ok'] is False
+    assert sep["combined_forbidden"] is True and sep["authorize"] is False
+    assert reject_sycophancy_signal(0.99)["reward_allowed"] is False
+    bad = draft_action({"too_long": {"noul": True}})
+    assert bad["backend"] == "investigate" and bad["malformed"] is True
+    # Occurrence-only ≠ factual verification
+    v = verify_claims_against_evidence(
+        ["package shipped"],
+        {"text": "The package shipped claim is false. It has not shipped."},
+    )
+    assert v["ok"] is False and v["semantic_support"] == "unavailable"
+    assert "package shipped" in v["occurrence_only"]
+    assert verify_claims_against_evidence(["x"], None)["ok"] is False
     # RO #4: evidence_channel rejects draft-as-evidence / missing
     assert evidence_channel(None)["available"] is False
     assert evidence_channel({"source": "draft", "text": "x"})["available"] is False
@@ -750,41 +1091,83 @@ def _offline_checks() -> None:
         raise AssertionError("call_jev should block without allow_outbound")
     except RuntimeError as exc:
         assert "BEFORE outbound" in str(exc) or "allow_outbound" in str(exc)
-
+    # HTTP error sanitize: provider body must not appear
+    import io, urllib.error
+    class _FakeHTTP(urllib.error.HTTPError):
+        def __init__(self):
+            urllib.error.HTTPError.__init__(
+                self, "https://api.typesafe.ai/v1/systemone", 500,
+                "Internal", hdrs=None, fp=io.BytesIO(b"SECRET_PROVIDER_BODY_LEAK")
+            )
+    real_urlopen = urllib.request.urlopen
+    def _boom(*a, **k):
+        raise _FakeHTTP()
+    urllib.request.urlopen = _boom
+    os.environ["TYPESAFE_API_KEY"] = os.environ.get("TYPESAFE_API_KEY") or "test-key-not-real"
+    try:
+        call_jev({"draft": "x"}, {"q": {"type": "noul", "instructions": "y?"}}, allow_outbound=True,
+                 privacy_approval={"ok": True, "reason": "test"})
+        raise AssertionError("expected HTTP error")
+    except RuntimeError as exc:
+        msg = str(exc)
+        assert "SECRET_PROVIDER_BODY_LEAK" not in msg
+        assert "HTTP 500" in msg and "request failed" in msg
+    finally:
+        urllib.request.urlopen = real_urlopen
+    # held-out-loaw is gate plumbing, not model calibration
+    cal = held_out_loaw_calibrate()
+    assert cal["ok"] is True and cal.get("model_calibration") is False
+    assert "NOT held-out model calibration" in cal["note"]
+    # proposal / replay / rollback contract shape (no real pref write on production)
+    proposal_shape = {
+        "version": 1,
+        "scoped_rule": {"kind": "correction_proposal", "instruction_precedence": "explicit_correction_over_standing"},
+        "rollback": {"action": "rollback_proposal"},
+    }
+    assert proposal_shape["scoped_rule"]["instruction_precedence"] == "explicit_correction_over_standing"
 
 def main(argv: list[str]) -> int:
     _offline_checks()
     command = argv[1] if len(argv) > 1 else "prove"
     if command == "prove":
+        # Isolated ledger only — never write production ~/.hermes/state/jev-evolve/ledger.jsonl
         draft = (
             "It is axiomatic that the aforementioned liability posture, viewed through "
             "the lens of comparative fault and the totality of the evidentiary matrix, "
             "clearly establishes a compelling narrative for immediate escalation."
         )
         correction = "shorter"
-        row = mark_synthetic(record(draft, correction, allow_text=True, allow_outbound=True))
-        # rewrite last ledger line as synthetic-tagged
-        rows = _read_ledger()
-        if rows:
-            rows[-1] = mark_synthetic(rows[-1])
-            LEDGER.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
-            row = rows[-1]
-        public = {
-            "id": row["id"],
-            "model": row["model"],
-            "proposed_home": row["proposed_home"],
-            "home_confidence": row["home_confidence"],
-            "applied": row["applied"],
-            "draft_gate": row["draft_gate"],
-            "speakable": (row["labels"].get("speakable") or {}).get("score"),
-            "speakable_confidence": (row["labels"].get("speakable") or {}).get("confidence"),
-            "correction_is_lock": (row["labels"].get("correction_is_lock") or {}).get("noul"),
-            "private_facts": (row["labels"].get("private_facts") or {}).get("noul"),
-            "usage": row["usage"],
-            "ledger": str(LEDGER),
-        }
-        print(json.dumps(public, indent=2))
-        return 0
+        with use_isolated_ledger(reset=True) as iso_root:
+            # synthetic tagged BEFORE append — no rewrite race on production
+            row = record(
+                draft, correction,
+                allow_text=True, allow_outbound=True, synthetic=True, append=True,
+            )
+            public = {
+                "id": row.get("id"),
+                "ok": row.get("ok"),
+                "appended": row.get("appended"),
+                "model": row.get("model"),
+                "proposed_home": row.get("proposed_home"),
+                "home_confidence": row.get("home_confidence"),
+                "applied": row.get("applied"),
+                "synthetic": row.get("synthetic"),
+                "prefs_eligible": row.get("prefs_eligible"),
+                "draft_gate": row.get("draft_gate"),
+                "speakable": ((row.get("labels") or {}).get("speakable") or {}).get("score"),
+                "speakable_confidence": ((row.get("labels") or {}).get("speakable") or {}).get("confidence"),
+                "correction_is_lock": ((row.get("labels") or {}).get("correction_is_lock") or {}).get("noul"),
+                "private_facts": ((row.get("labels") or {}).get("private_facts") or {}).get("noul"),
+                "usage": row.get("usage"),
+                "ledger": str(LEDGER),
+                "isolated_root": str(iso_root),
+                "production_ledger_untouched": str(DEFAULT_ROOT / "ledger.jsonl"),
+                "proposal": row.get("proposal"),
+                "validation_failures": row.get("validation_failures"),
+                "note": row.get("note"),
+            }
+            print(json.dumps(public, indent=2))
+            return 0 if row.get("ok") and row.get("appended") else 1
     if command == "gate":
         print(json.dumps(gate_draft(argv[2]), indent=2))
         return 0
@@ -799,10 +1182,14 @@ def main(argv: list[str]) -> int:
         print(json.dumps(result, indent=2))
         return 0 if result.get("ok") else 1
     if command == "held-out":
+        # Read/prove against isolated ledger only — zero production preference writes
         row_id = argv[2] if len(argv) > 2 else None
-        result = held_out_check(row_id)
-        print(json.dumps(result, indent=2))
-        return 0 if result.get("ok") else 1
+        with use_isolated_ledger(reset=False):
+            result = held_out_check(row_id)
+            result["isolated_ledger"] = str(LEDGER)
+            result["production_ledger_untouched"] = str(DEFAULT_ROOT / "ledger.jsonl")
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("ok") else 1
     if command == "prefs":
         sub = argv[2] if len(argv) > 2 else "show"
         if sub == "clear":
@@ -810,9 +1197,30 @@ def main(argv: list[str]) -> int:
         else:
             print(json.dumps(prefs_snapshot(), indent=2))
         return 0
-    print("use: prove | gate <draft> | replay <row_id> | held-out [row_id] | held-out-loaw | prefs [show|clear]", file=sys.stderr)
+    if command == "propose":
+        if len(argv) < 3:
+            print("use: propose <row_id>", file=sys.stderr)
+            return 2
+        print(json.dumps(propose_correction_rule(argv[2]), indent=2))
+        return 0
+    if command == "replay-proposal":
+        if len(argv) < 3:
+            print("use: replay-proposal <row_id>", file=sys.stderr)
+            return 2
+        print(json.dumps(replay_proposal(argv[2]), indent=2))
+        return 0
+    if command == "rollback":
+        if len(argv) < 3:
+            print("use: rollback <row_id>", file=sys.stderr)
+            return 2
+        print(json.dumps(rollback_proposal(argv[2]), indent=2))
+        return 0
+    print(
+        "use: prove | gate <draft> | replay <row_id> | held-out [row_id] | held-out-loaw | "
+        "prefs [show|clear] | propose <row_id> | replay-proposal <row_id> | rollback <row_id>",
+        file=sys.stderr,
+    )
     return 2
-
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))

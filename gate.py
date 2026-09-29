@@ -13,9 +13,11 @@ scored apart from grounding and task success.
 
 RO harden (WIL-914 side branch): unknown types fail-closed; choice/score
 require full shape before act; missing required miss-labels ≠ clean pass.
-Choice act requires full finite normalized distribution + selected=argmax
-bound to request option set. Score act requires 2..10 legend/index bounds
-+ EV-consistent score (not mere finite presence). Malformed never throws.
+Choice/score option keys and score legends bind ONLY to a trusted request
+schema passed separately — never to answer-supplied keys. Choice act needs
+full finite normalized distribution + selected=argmax over that request set.
+Score act needs 2..10 legend/index bounds + EV-consistent score. Malformed
+never throws.
 """
 
 from __future__ import annotations
@@ -109,58 +111,103 @@ def _finite_prob(value: Any) -> float | None:
 
 
 def _options_map(answer: dict) -> dict | None:
-    """Return a well-formed options/criteria/probabilities map, or None."""
-    for key in ("options", "choices", "criteria", "probabilities"):
+    """Return a well-formed options/criteria/probabilities map from an answer, or None.
+
+    Used only as a distribution source (values). Option KEYS must still come
+    from a trusted request schema — never from this map alone.
+    """
+    if not isinstance(answer, dict):
+        return None
+    for key in ("probabilities", "options", "choices"):
         value = answer.get(key)
         if isinstance(value, dict) and len(value) >= 1:
-            # reject empty-string keys / non-sensible maps
             if any(not isinstance(k, str) or not k.strip() for k in value.keys()):
                 return None
             return value
     return None
 
 
-def _expected_choice_keys(answer: dict) -> list[str] | None:
-    """Bind choice validation to the request option set when present.
+def request_schema_choice_keys(request_schema: dict | None) -> list[str] | None:
+    """Extract choice option keys ONLY from a trusted request schema.
 
-    Prefer explicit request_options / options-as-list / criteria-dict keys.
-    Fall back to probabilities/options map keys. Never invent options.
+    Never reads the answer. Accepts criteria dict, options dict/list, or
+    explicit request_options / expected_options on the *request* object.
     """
-    if not isinstance(answer, dict):
+    if not isinstance(request_schema, dict):
         return None
     for key in ("request_options", "expected_options"):
-        raw = answer.get(key)
+        raw = request_schema.get(key)
         if isinstance(raw, (list, tuple)):
             keys = [k for k in raw if isinstance(k, str) and k.strip()]
             if len(keys) == len(raw) and len(keys) >= 1:
                 return list(keys)
         if isinstance(raw, dict) and raw:
             keys = [k for k in raw.keys() if isinstance(k, str) and k.strip()]
-            if len(keys) == len(raw):
+            if len(keys) == len(raw) and len(keys) >= 1:
                 return keys
-    options = answer.get("options")
+    criteria = request_schema.get("criteria")
+    if isinstance(criteria, dict) and criteria:
+        keys = [k for k in criteria.keys() if isinstance(k, str) and k.strip()]
+        if len(keys) == len(criteria) and len(keys) >= 1:
+            return keys
+    options = request_schema.get("options")
     if isinstance(options, (list, tuple)):
         keys = [k for k in options if isinstance(k, str) and k.strip()]
         if len(keys) == len(options) and len(keys) >= 1:
             return list(keys)
-    criteria = answer.get("criteria")
-    if isinstance(criteria, dict) and criteria:
-        keys = [k for k in criteria.keys() if isinstance(k, str) and k.strip()]
-        if len(keys) == len(criteria):
+    if isinstance(options, dict) and options:
+        keys = [k for k in options.keys() if isinstance(k, str) and k.strip()]
+        if len(keys) == len(options) and len(keys) >= 1:
             return keys
-    probs = answer.get("probabilities")
-    if isinstance(probs, dict) and probs:
-        keys = [k for k in probs.keys() if isinstance(k, str) and k.strip()]
-        if len(keys) == len(probs):
-            return keys
-    # last resort: options/choices dict maps
-    for key in ("options", "choices"):
-        value = answer.get(key)
-        if isinstance(value, dict) and value:
-            keys = [k for k in value.keys() if isinstance(k, str) and k.strip()]
-            if len(keys) == len(value):
-                return keys
     return None
+
+
+def request_schema_score_levels(request_schema: dict | None) -> list[str] | None:
+    """Extract ordered score legend (len 2..10) ONLY from trusted request schema."""
+    if not isinstance(request_schema, dict):
+        return None
+    criteria = request_schema.get("criteria")
+    if criteria is None:
+        criteria = request_schema.get("levels")
+    if isinstance(criteria, list):
+        if not (SCORE_LEGEND_MIN <= len(criteria) <= SCORE_LEGEND_MAX):
+            return None
+        labels: list[str] = []
+        for item in criteria:
+            if isinstance(item, bool) or item is None:
+                return None
+            if isinstance(item, str) and item.strip():
+                labels.append(item.strip())
+            else:
+                return None
+        return labels
+    legend = request_schema.get("legend")
+    if isinstance(legend, dict) and legend:
+        n = len(legend)
+        if not (SCORE_LEGEND_MIN <= n <= SCORE_LEGEND_MAX):
+            return None
+        labels = []
+        for i in range(n):
+            key = str(i)
+            if key not in legend:
+                return None
+            val = legend[key]
+            if not isinstance(val, str) or not val.strip():
+                return None
+            labels.append(val.strip())
+        if any(k not in {str(i) for i in range(n)} for k in legend.keys()):
+            return None
+        return labels
+    return None
+
+
+# Back-compat aliases — both require a trusted request; answer-only paths removed.
+def _expected_choice_keys(request_schema: dict | None) -> list[str] | None:
+    return request_schema_choice_keys(request_schema)
+
+
+def _score_legend_levels(request_schema: dict | None) -> list[str] | None:
+    return request_schema_score_levels(request_schema)
 
 
 def _normalized_distribution(raw: Any, expected_keys: list[str]) -> dict[str, float] | None:
@@ -186,27 +233,25 @@ def _normalized_distribution(raw: Any, expected_keys: list[str]) -> dict[str, fl
     return out
 
 
-def choice_well_formed(answer: dict) -> bool:
+def choice_well_formed(answer: dict, request_schema: dict | None = None) -> bool:
     """Choice requires selected = argmax over a full finite normalized distribution.
 
-    Option keys must match the expected request option set when supplied.
-    Malformed list/non-string choice → False (never throw).
+    Option keys bind ONLY to the trusted request schema. Answer-supplied
+    request_options / probabilities keys are NEVER the option set (RO bind).
+    Without a trusted request schema → False (fail-closed). Malformed never throws.
     """
     if not isinstance(answer, dict) or answer.get("type") != "choice":
         return False
+    expected = request_schema_choice_keys(request_schema)
+    if expected is None:
+        return False
     choice = answer.get("choice")
-    # reject missing / blank / non-scalar choice (list/dict/bool)
     if choice is None or isinstance(choice, (bool, list, tuple, dict)):
         return False
     if not isinstance(choice, str) or not choice.strip():
-        # allow non-str scalars only if they appear as option keys after str()? no — keys are str
         if not isinstance(choice, (int, float)) or isinstance(choice, bool):
             return False
         choice = str(choice)
-    expected = _expected_choice_keys(answer)
-    if expected is None:
-        return False
-    # probabilities preferred; else options/choices numeric maps
     dist_raw = answer.get("probabilities")
     if not isinstance(dist_raw, dict):
         for key in ("options", "choices"):
@@ -220,62 +265,21 @@ def choice_well_formed(answer: dict) -> bool:
     if choice not in dist:
         return False
     peak = max(dist.values())
-    # selected must be an argmax (ties allowed if selected is among max)
     if dist[choice] < peak:
         return False
     return True
 
 
-def _score_legend_levels(answer: dict) -> list[str] | None:
-    """Return ordered legend labels (len 2..10) or None.
-
-    Accepts criteria list (request shape) or legend map keyed 0..n-1.
-    Does not invent levels.
-    """
-    if not isinstance(answer, dict):
-        return None
-    criteria = answer.get("criteria")
-    if isinstance(criteria, list):
-        if not (SCORE_LEGEND_MIN <= len(criteria) <= SCORE_LEGEND_MAX):
-            return None
-        labels: list[str] = []
-        for item in criteria:
-            if isinstance(item, bool) or item is None:
-                return None
-            if isinstance(item, str) and item.strip():
-                labels.append(item.strip())
-            else:
-                return None
-        return labels
-    legend = answer.get("legend")
-    if isinstance(legend, dict) and legend:
-        n = len(legend)
-        if not (SCORE_LEGEND_MIN <= n <= SCORE_LEGEND_MAX):
-            return None
-        labels = []
-        for i in range(n):
-            key = str(i)
-            if key not in legend:
-                return None
-            val = legend[key]
-            if not isinstance(val, str) or not val.strip():
-                return None
-            labels.append(val.strip())
-        if any(k not in {str(i) for i in range(n)} for k in legend.keys()):
-            return None
-        return labels
-    return None
-
-
-def score_well_formed(answer: dict) -> bool:
+def score_well_formed(answer: dict, request_schema: dict | None = None) -> bool:
     """Score requires 2..10 legend/index bounds + EV-consistent finite score.
 
-    Mere presence of a finite score is NOT enough (score=999 must fail-closed).
-    Probabilities must be a full finite normalized distribution over 0..n-1.
+    Legend/levels bind ONLY to the trusted request schema — never answer
+    criteria/legend alone. Mere presence of a finite score is NOT enough.
+    Without a trusted request schema → False.
     """
     if not isinstance(answer, dict) or answer.get("type") != "score":
         return False
-    levels = _score_legend_levels(answer)
+    levels = request_schema_score_levels(request_schema)
     if levels is None:
         return False
     n = len(levels)
@@ -292,7 +296,6 @@ def score_well_formed(answer: dict) -> bool:
     score_f = float(score)
     if not math.isfinite(score_f):
         return False
-    # index bounds: 0 .. n-1 (TypeSafe score = weighted mean of level indices)
     if score_f < 0.0 or score_f > float(n - 1):
         return False
     expected = sum(int(k) * dist[k] for k in index_keys)
@@ -301,13 +304,17 @@ def score_well_formed(answer: dict) -> bool:
     return True
 
 
-def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
+def decide_answer(
+    answer: dict,
+    stakes: str = "ordinary",
+    request_schema: dict | None = None,
+) -> str:
     """Return act, review, stop, or approve for one answer.
 
     Unavailable / malformed / unknown-type answers → review (ordinary) or
     stop (effect). Never silently authorize. High confidence on an unknown
     type is NOT permission to act (RO #1). Choice/score require full shape
-    before confidence can authorize (RO #2).
+    bound to trusted request schema before confidence can authorize (RO #2).
     """
     if stakes not in STAKES:
         raise ValueError(f"unknown stakes: {stakes}")
@@ -319,7 +326,6 @@ def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
         if probability is None:
             return _fail_closed(stakes)
         if stakes == "effect":
-            # A Noul can only flag that approval may be needed — never authorize.
             return "approve"
         if stakes == "harmless":
             return "act"
@@ -327,14 +333,12 @@ def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
             return "act"
         return "review"
 
-    # RO #1: unknown / missing type → fail-closed (confidence irrelevant)
     if kind not in ("choice", "score"):
         return _fail_closed(stakes)
 
-    # RO #2: full type/shape validation before act
-    if kind == "choice" and not choice_well_formed(answer):
+    if kind == "choice" and not choice_well_formed(answer, request_schema):
         return _fail_closed(stakes)
-    if kind == "score" and not score_well_formed(answer):
+    if kind == "score" and not score_well_formed(answer, request_schema):
         return _fail_closed(stakes)
 
     confidence = _confidence(answer)
@@ -349,9 +353,71 @@ def decide_answer(answer: dict, stakes: str = "ordinary") -> str:
     return "act"
 
 
-def backend_verb(answer: dict, stakes: str = "ordinary") -> str:
+def backend_verb(
+    answer: dict,
+    stakes: str = "ordinary",
+    request_schema: dict | None = None,
+) -> str:
     """Map one answer to act | investigate | clarify. Never auto-mutates."""
-    return _BACKEND_MAP[decide_answer(answer, stakes)]
+    return _BACKEND_MAP[decide_answer(answer, stakes, request_schema)]
+
+
+def validate_answer_against_request(
+    answer: dict | None,
+    request_schema: dict,
+) -> dict[str, Any]:
+    """Request-bound validation result for one answer. Never throws."""
+    if not isinstance(request_schema, dict):
+        return {"ok": False, "reason": "missing_request_schema", "backend": "investigate"}
+    qtype = request_schema.get("type")
+    if qtype not in KNOWN_ANSWER_TYPES:
+        return {"ok": False, "reason": "unknown_request_type", "backend": "investigate"}
+    if not isinstance(answer, dict):
+        return {"ok": False, "reason": "missing_answer", "backend": "investigate"}
+    if answer.get("type") != qtype:
+        return {"ok": False, "reason": "type_mismatch", "backend": "investigate"}
+    if qtype == "noul":
+        if _noul(answer) is None and not answer.get("unavailable"):
+            return {"ok": False, "reason": "malformed_noul", "backend": "investigate"}
+        return {"ok": True, "reason": "noul_ok", "backend": backend_verb(answer, "ordinary", request_schema)}
+    if qtype == "choice":
+        if not choice_well_formed(answer, request_schema):
+            return {"ok": False, "reason": "choice_not_request_bound", "backend": "investigate"}
+        return {"ok": True, "reason": "choice_ok", "backend": backend_verb(answer, "ordinary", request_schema)}
+    if not score_well_formed(answer, request_schema):
+        return {"ok": False, "reason": "score_not_request_bound", "backend": "investigate"}
+    return {"ok": True, "reason": "score_ok", "backend": backend_verb(answer, "ordinary", request_schema)}
+
+
+def validate_answers_against_request(
+    answers: dict | None,
+    questions: dict,
+) -> dict[str, Any]:
+    """Validate a full answers map against trusted request questions.
+
+    Returns {ok, failures, backends}. Does not throw. Extra answer keys that
+    were not in the request are recorded as failures (not silently trusted).
+    """
+    if not isinstance(questions, dict) or not questions:
+        return {"ok": False, "failures": {"_request": "empty_questions"}, "backends": {}}
+    if not isinstance(answers, dict):
+        return {
+            "ok": False,
+            "failures": {name: "missing_answer" for name in questions},
+            "backends": {name: "investigate" for name in questions},
+        }
+    failures: dict[str, str] = {}
+    backends: dict[str, str] = {}
+    for name, schema in questions.items():
+        result = validate_answer_against_request(answers.get(name), schema)
+        backends[name] = result["backend"]
+        if not result["ok"]:
+            failures[name] = result["reason"]
+    extras = [k for k in answers.keys() if k not in questions]
+    for extra in extras:
+        failures[extra] = "unexpected_answer_key"
+        backends[extra] = "investigate"
+    return {"ok": len(failures) == 0, "failures": failures, "backends": backends}
 
 
 def authority_from_noul(answer: dict) -> dict[str, Any]:
