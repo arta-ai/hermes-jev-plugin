@@ -14,6 +14,7 @@ provides_tools:
   - jev_check
   - jev_route
   - jev_score
+  - jev_standing_instruction
 requires_env:
   - name: TYPESAFE_API_KEY
     description: TypeSafe API key for the Jev System One API

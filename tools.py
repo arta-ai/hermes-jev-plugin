@@ -212,3 +212,41 @@ def score(args: dict, ctx=None, **kwargs) -> str:
             "usage": client.usage_of(resp),
         }
     )
+
+
+def standing_instruction(args: dict, ctx=None, **kwargs) -> str:
+    """Read-only drafting consumer — mode-filtered resolve_standing_instruction.
+
+    file:function tools.standing_instruction. Does not call TypeSafe, does not
+    write ledger/prefs, does not generate draft text.
+    """
+    home = args.get("home")
+    mode = args.get("mode")
+    if not isinstance(home, str) or not home.strip():
+        return _error("Need a non-empty 'home' string (e.g. writing_skill).")
+    if mode not in ("legal", "creative"):
+        return _error("Need mode 'legal' or 'creative' (scopes stay separate).")
+    brief = args.get("brief") if isinstance(args.get("brief"), str) else ""
+    explicit = args.get("explicit_correction")
+    if explicit is not None and not isinstance(explicit, str):
+        return _error("'explicit_correction' must be a string when provided.")
+    import sys
+
+    evolve_mod = sys.modules.get("evolve")
+    if evolve_mod is None:
+        try:
+            from . import evolve as evolve_mod  # type: ignore
+        except ImportError:
+            import evolve as evolve_mod  # type: ignore
+    try:
+        payload = evolve_mod.drafting_standing_context(
+            home.strip(),
+            mode,
+            brief=brief,
+            explicit_correction=explicit,
+        )
+    except Exception as exc:  # noqa: BLE001 — always JSON for the model
+        return _error(f"standing resolve failed: {exc}")
+    # Model-facing surface: prefer the nested payload + resolved fields.
+    return client.compact_json(payload)
+

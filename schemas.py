@@ -150,4 +150,40 @@ SCORE = {
     },
 }
 
-SCHEMAS = [EVALUATE, CHECK, ROUTE, SCORE]
+
+STANDING_INSTRUCTION = {
+    "name": "jev_standing_instruction",
+    "description": (
+        "Read-only scoped standing instruction for drafting (WIL-914 adaptation consumer). "
+        "Returns mode-filtered resolve_standing_instruction for a home×mode (legal|creative). "
+        "Use BEFORE drafting with arta-writing or wildeboer-firm-writing so the draft model "
+        "receives the resolved instruction in context. Explicit correction outranks standing. "
+        "Unknown/missing mode stays unavailable. Does NOT evaluate drafts (not gate_draft), "
+        "does NOT generate text, does NOT write preferences or the ledger."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "home": {
+                "type": "string",
+                "description": "Standing home, usually writing_skill for drafting voice/structure.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["legal", "creative"],
+                "description": "legal and creative are separate scopes — never mix.",
+            },
+            "brief": {
+                "type": "string",
+                "description": "Optional short drafting brief (echoed into payload; not stored).",
+            },
+            "explicit_correction": {
+                "type": "string",
+                "description": "Optional this-turn correction. Outranks standing when non-empty.",
+            },
+        },
+        "required": ["home", "mode"],
+    },
+}
+
+SCHEMAS = [EVALUATE, CHECK, ROUTE, SCORE, STANDING_INSTRUCTION]

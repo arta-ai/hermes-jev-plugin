@@ -542,6 +542,85 @@ def _consumer_standing_rules(
     return out
 
 
+def drafting_standing_context(
+    home: str,
+    mode: str,
+    *,
+    brief: str = "",
+    explicit_correction: str | None = None,
+) -> dict:
+    """Native drafting consumer binding — read-only scoped standing for draft production.
+
+    Returns mode-filtered `resolve_standing_instruction` (not the full standing map,
+    not gate_draft evaluation, not generated draft text). Callers (writing skills /
+    jev_standing_instruction tool) place this payload in the model-facing context
+    before drafting. Does not write ledger, standing, prefs, or skills.
+    """
+    if mode not in MODES:
+        raise ValueError(f"unknown mode: {mode}")
+    if not isinstance(home, str) or not home.strip():
+        raise ValueError("home is required")
+    home = home.strip()
+    if home not in registered_homes():
+        return {
+            "ok": False,
+            "consumer": "drafting",
+            "home": home,
+            "mode": mode,
+            "resolved_standing_instruction": None,
+            "standing_rules": None,
+            "usable": False,
+            "instruction": None,
+            "brief": brief or "",
+            "note": "Unregistered home — standing unavailable for drafting.",
+        }
+    standing_rules = _consumer_standing_rules(
+        mode,
+        home=home,
+        explicit_correction=explicit_correction,
+    )
+    resolved = standing_rules.get("resolved_instruction") or resolve_standing_instruction(
+        home,
+        mode,
+        explicit_correction=explicit_correction,
+    )
+    usable = isinstance(resolved, dict) and resolved.get("availability") == "usable"
+    instruction = resolved.get("instruction") if usable else None
+    return {
+        "ok": True,
+        "consumer": "drafting",
+        "read_only": True,
+        "home": home,
+        "mode": mode,
+        "resolved_standing_instruction": resolved,
+        "standing_rules": standing_rules,
+        "mode_filtered": True,
+        "usable": bool(usable),
+        "instruction": instruction,
+        "brief": brief or "",
+        "explicit_correction_applied": bool(
+            isinstance(explicit_correction, str) and explicit_correction.strip()
+        ),
+        "model_facing_payload": {
+            "kind": "resolved_standing_instruction",
+            "home": home,
+            "mode": mode,
+            "availability": (resolved or {}).get("availability"),
+            "precedence": (resolved or {}).get("precedence"),
+            "instruction": instruction,
+            "scope": (resolved or {}).get("scope"),
+            "mode_filtered": True,
+            "note": (
+                "Apply this scoped standing when drafting. "
+                "Do not use other-mode standing. Explicit correction outranks standing."
+                if usable
+                else "No usable scoped standing for this home×mode — draft without inventing a preference."
+            ),
+        },
+        "note": "Drafting consumer — mode-filtered resolve only; no ledger/pref write; not gate_draft.",
+    }
+
+
 def _load_standing() -> dict:
     if not STANDING.exists():
         return {"labels": {}, "note": "No label is standing until it repeats and apply is explicit."}
@@ -1509,6 +1588,22 @@ def _offline_checks() -> None:
         assert "writing_skill::creative" in creative_only["labels"]
         assert "writing_skill" not in creative_only["labels"]  # legal legacy not in creative filter
         assert creative_only["resolved_instruction"]["availability"] == "usable"
+        # Drafting consumer binding: mode-filtered resolve into model-facing payload
+        draft_legal = drafting_standing_context("writing_skill", "legal", brief="synthetic brief")
+        assert draft_legal["ok"] and draft_legal["consumer"] == "drafting"
+        assert draft_legal["mode_filtered"] is True
+        assert draft_legal["usable"] is True
+        assert "Formal" in (draft_legal["instruction"] or "")
+        assert draft_legal["model_facing_payload"]["mode"] == "legal"
+        assert "writing_skill::creative" not in json.dumps(draft_legal["standing_rules"].get("labels") or {})
+        draft_creative = drafting_standing_context("writing_skill", "creative")
+        assert draft_creative["usable"] and "Casual" in (draft_creative["instruction"] or "")
+        assert draft_creative["model_facing_payload"]["mode"] == "creative"
+        overridden = drafting_standing_context(
+            "writing_skill", "legal", explicit_correction="Plain wording for this draft."
+        )
+        assert overridden["instruction"] == "Plain wording for this draft."
+        assert overridden["model_facing_payload"]["precedence"] == "explicit_correction"
 
 def main(argv: list[str]) -> int:
     _offline_checks()
@@ -1599,8 +1694,18 @@ def main(argv: list[str]) -> int:
             return 2
         print(json.dumps(rollback_proposal(argv[2]), indent=2))
         return 0
+    if command == "drafting-context":
+        if len(argv) < 4:
+            print("use: drafting-context <home> <mode> [brief...]", file=sys.stderr)
+            return 2
+        home, mode = argv[2], argv[3]
+        brief = " ".join(argv[4:]) if len(argv) > 4 else ""
+        # Isolated synthetic only when HERMES_JEV_ISOLATED=1; default read-only against current paths
+        print(json.dumps(drafting_standing_context(home, mode, brief=brief), indent=2))
+        return 0
     print(
-        "use: prove | gate <draft> | replay <row_id> | held-out [row_id] | held-out-loaw | "
+        "use: prove | gate <draft> | drafting-context <home> <mode> [brief...] | "
+        "replay <row_id> | held-out [row_id] | held-out-loaw | "
         "prefs [show|clear] | propose <row_id> | replay-proposal <row_id> | rollback <row_id>",
         file=sys.stderr,
     )

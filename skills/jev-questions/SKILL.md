@@ -115,3 +115,9 @@ State: a bug report. Use `jev_score` with concrete ordered levels:
 - choice → `choice`, `probabilities`, `confidence`
 - score → `score`, `legend`, `confidence`
 - `jev_check` adds a convenience `verdict`: yes (≥0.75) / no (≤0.25) / uncertain (between)
+
+## Standing for drafting (adaptation consumer)
+
+When a writing skill is about to draft, call `jev_standing_instruction` (home=`writing_skill`, mode=`legal`|`creative`). It returns mode-filtered resolved standing for the model-facing payload. It is **not** draft generation and **not** `gate_draft`.
+
+
